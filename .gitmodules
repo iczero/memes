@@ -1,0 +1,3 @@
+[submodule "mlcommon"]
+	path = mlcommon
+	url = https://github.com/iczero/mlcommon

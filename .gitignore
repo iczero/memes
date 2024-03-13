@@ -1,0 +1,6 @@
+/venv*
+.ipynb_checkpoints/
+__pycache__
+*.pyc
+# exclude random stuff from git
+/misc

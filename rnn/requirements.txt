@@ -1,0 +1,6 @@
+sentencepiece
+matplotlib
+torch
+aim
+safetensors
+tqdm
