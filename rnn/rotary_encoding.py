@@ -11,6 +11,8 @@ from torch import nn
 BASE = 10000
 
 class RotaryEncoding(nn.Module):
+    "Implements rotary positional encoding (RoPE)"
+
     def __init__(self, hidden_dim: int, seq_len: int):
         super().__init__()
         assert hidden_dim % 2 == 0

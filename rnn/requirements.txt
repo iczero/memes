@@ -4,3 +4,4 @@ torch
 aim
 safetensors
 tqdm
+zstandard
