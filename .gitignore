@@ -4,3 +4,4 @@ __pycache__
 *.pyc
 # exclude random stuff from git
 /misc
+/data

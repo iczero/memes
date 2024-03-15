@@ -58,7 +58,7 @@ class ModelConfig:
         return cls(
             n_embed=128,
             n_attention_heads=8,
-            vocab_size=1, # TODO: train tokenizer
+            vocab_size=32000,
             short_ctx_len=64,
             internal_seq_len=256,
             ff_dropout_p=0.0,
@@ -314,4 +314,5 @@ class RNNSequence(nn.Module):
         self.decode = OutputDecode(config)
 
     def forward(self):
+        # this module probably needs more than just forward()
         raise NotImplementedError()
