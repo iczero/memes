@@ -95,18 +95,16 @@ class PartialCrossAttention(nn.Module):
     def forward(self, external: torch.Tensor, internal: torch.Tensor):
         # external is the other sequence concatenated to k/v, internal is our own sequence
         # q shape: (batch, seq, n_heads, n_embed)
-        q = self.q_linear(internal).unflatten(-1, (self.n_attention_heads, self.n_embed))
+        # transpose (batch, seq, n_heads, n_embed) -> (batch, n_heads, seq, n_embed) for sdp
+        q = self.q_linear(internal) \
+            .unflatten(-1, (self.n_attention_heads, self.n_embed)) \
+            .transpose(1, 2)
         kv_seq = torch.concat(external, internal, dim=1)
         # kv_merged shape: (batch, seq, 2, n_heads, n_embed)
         kv_merged = self.kv_linear(kv_seq).unflatten(-1, (2, self.n_attention_heads, self.n_embed))
         # extract from merged
-        k = kv_merged[..., 0, :, :]
-        v = kv_merged[..., 1, :, :]
-
-        # transpose (batch, seq, n_heads, n_embed) -> (batch, n_heads, seq, n_embed) for sdp
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        k = kv_merged[..., 0, :, :].transpose(1, 2)
+        v = kv_merged[..., 1, :, :].transpose(1, 2)
 
         # why does pylint think this isn't callable?
         # pylint: disable-next=not-callable
@@ -234,7 +232,86 @@ class OutputLayer(nn.Module):
         out = self.feedforward(out)
         return out
 
-class RNNDerp(nn.Module):
+class RNNPonder(nn.Module):
+    """
+    The part of the model rerun for ponder
+
+    Contains intermediate layers followed by an output layer. Does not contain
+    the input layer, which should be run before.
+    """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.norm = nn.LayerNorm((config.n_embed,))
+        self.intermediate = [IntermediateLayer(config) for _ in range(config.n_intermediate)]
+        self.output = OutputLayer(config)
 
+    # recurrent is recurrent state, internal is output of input layer, or if
+    # pondering, the internal output of the previous RNNPonder step
+    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
+        bypass = recurrent
+        recurrent = self.norm(recurrent)
+        for layer in self.intermediate:
+            internal = layer(recurrent, internal)
+
+        resid = self.output(recurrent, internal)
+        out = bypass + resid
+        return out, internal
+
+class OutputDecode(nn.Module):
+    "Derive output token and ponder p_halt from recurrent state"
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        # standard cross-attention scheme except queries are directly parameters
+        self.q_out = nn.Parameter(torch.randn(config.n_embed))
+        self.q_p_halt = nn.Parameter(torch.randn(config.n_embed))
+        self.kv_linear = nn.Linear(
+            config.n_embed,
+            2 * config.n_attention_heads * config.n_embed,
+            bias=config.qkv_bias,
+        )
+
+        ff_in_dim = config.n_embed * config.n_attention_heads
+        self.out_feedforward = nn.Sequential(
+            nn.Flatten(start_dim=-2, end_dim=-1),
+            nn.Linear(ff_in_dim, ff_in_dim),
+            config.activation(),
+            nn.Linear(ff_in_dim, config.n_embed),
+        )
+
+        self.p_halt_feedforward = nn.Sequential(
+            nn.Flatten(start_dim=-2, end_dim=-1),
+            nn.Linear(ff_in_dim, ff_in_dim),
+            config.activation(),
+            nn.Linear(ff_in_dim, 1), # p_halt
+        )
+
+    def forward(self, recurrent: torch.Tensor):
+        # (batch, "seq", n_embed)
+        q = torch.stack((self.q_out, self.q_p_halt)).unsqueeze(0)
+        kv_merged = self.kv_linear(recurrent) \
+            .unflatten(-1, (2, self.n_attention_heads, self.n_embed))
+        # extract and transpose for sdp
+        k = kv_merged[..., 0, :, :].transpose(1, 2)
+        v = kv_merged[..., 1, :, :].transpose(1, 2)
+
+        # no dropout here
+        # pylint: disable-next=not-callable
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2)
+        # (batch, "seq", n_heads, n_embed) -> (batch, n_embed)
+        token_out = self.out_feedforward(attn_out[:, 0, :, :])
+        # -> (batch, 1)
+        p_halt_out = self.p_halt_feedforward(attn_out[:, 1, :, :])
+
+        return token_out, p_halt_out
+
+class RNNSequence(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.input = InputLayer(config)
+        self.ponder = RNNPonder(config)
+        self.decode = OutputDecode(config)
+
+    def forward(self):
+        raise NotImplementedError()
