@@ -40,7 +40,7 @@ def main():
                 if sentences % 100 == 0:
                     file_wrap.pbar.set_description(f'sentences: {sentences}', refresh=False)
 
-                if sentences >= 262144:
+                if sentences >= 393216:
                     file_wrap.pbar.set_description(
                         f'sentences: {sentences}, input loading done', refresh=True
                     )
@@ -54,12 +54,14 @@ def main():
         max_sentence_length=16384,
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,
+        normalization_rule_name='nfkc',
         byte_fallback=True,
         # enable all special tokens
         unk_id=0,
         bos_id=1,
         eos_id=2,
         pad_id=3,
+        control_symbols='<del>',
     )
 
 if __name__ == '__main__':

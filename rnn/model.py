@@ -63,7 +63,7 @@ class ModelConfig:
             internal_seq_len=256,
             ff_dropout_p=0.0,
             attn_dropout_p=0.0,
-            n_intermediate=3,
+            n_intermediate=4,
             ponder_continue_penalty=10.0,
             ponder_loss_penalty=1.1,
             resid_gate_multiplier=2.0,
@@ -99,7 +99,7 @@ class PartialCrossAttention(nn.Module):
         q = self.q_linear(internal) \
             .unflatten(-1, (self.n_attention_heads, self.n_embed)) \
             .transpose(1, 2)
-        kv_seq = torch.concat(external, internal, dim=1)
+        kv_seq = torch.concat((external, internal), dim=1)
         # kv_merged shape: (batch, seq, 2, n_heads, n_embed)
         kv_merged = self.kv_linear(kv_seq).unflatten(-1, (2, self.n_attention_heads, self.n_embed))
         # extract from merged
@@ -243,7 +243,7 @@ class RNNPonder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.norm = nn.LayerNorm((config.n_embed,))
-        self.intermediate = [IntermediateLayer(config) for _ in range(config.n_intermediate)]
+        self.intermediate = nn.ModuleList(IntermediateLayer(config) for _ in range(config.n_intermediate))
         self.output = OutputLayer(config)
 
     # recurrent is recurrent state, internal is output of input layer, or if
@@ -262,6 +262,8 @@ class OutputDecode(nn.Module):
     "Derive output token and ponder p_halt from recurrent state"
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.n_attention_heads = config.n_attention_heads
+        self.n_embed = config.n_embed
         # standard cross-attention scheme except queries are directly parameters
         self.q_out = nn.Parameter(torch.randn(config.n_embed))
         self.q_p_halt = nn.Parameter(torch.randn(config.n_embed))
@@ -277,6 +279,7 @@ class OutputDecode(nn.Module):
             nn.Linear(ff_in_dim, ff_in_dim),
             config.activation(),
             nn.Linear(ff_in_dim, config.n_embed),
+            nn.Linear(config.n_embed, config.vocab_size),
         )
 
         self.p_halt_feedforward = nn.Sequential(
@@ -304,11 +307,13 @@ class OutputDecode(nn.Module):
         # -> (batch, 1)
         p_halt_out = self.p_halt_feedforward(attn_out[:, 1, :, :])
 
-        return token_out, p_halt_out
+        # out: (batch, n_embed), (batch)
+        return token_out, F.sigmoid(p_halt_out.squeeze(-1))
 
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.recurrent_init = nn.Parameter(torch.randn((config.recurrent_seq_len, config.n_embed)))
         self.input = InputLayer(config)
         self.ponder = RNNPonder(config)
         self.decode = OutputDecode(config)

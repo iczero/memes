@@ -29,6 +29,7 @@ class RotaryEncoding(nn.Module):
         # a2: cos(m*t) * a + sin(m*t) * -b
         # b2: sin(m*t) * a + cos(m*t) *  b
 
+        # in: (batch..., seq, n_embed)
         a = x[..., 0::2]
         b = x[..., 1::2]
         a2 = self.cos_cached * a + self.sin_cached * -b
