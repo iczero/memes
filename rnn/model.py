@@ -1,75 +1,10 @@
-import dataclasses
-from dataclasses import dataclass
-from collections.abc import Callable
-
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .common import ModelConfig
 from .rotary_encoding import RotaryEncoding
 
-
-@dataclass
-class ModelConfig:
-    "Embedding dimensions"
-    n_embed: int
-    "Number of attention heads"
-    n_attention_heads: int
-    "Vocabulary size"
-    vocab_size: int
-    "Length of input short context sequence"
-    short_ctx_len: int
-    "Length of internal sequence"
-    internal_seq_len: int
-    "Length of recurrent sequence"
-    recurrent_seq_len: int = dataclasses.field(init=False)
-    "Probability of dropout after feedforward"
-    ff_dropout_p: float
-    "Probability of dropout after attention"
-    attn_dropout_p: float
-    "Number of intermediate layers"
-    n_intermediate: int
-    "Ponder: static penalty for pondering"
-    ponder_continue_penalty: float
-    "Ponder: penalty for halting with loss"
-    ponder_loss_penalty: float
-    "Multiplier for residual gating"
-    resid_gate_multiplier: float
-    "Activation function"
-    activation: Callable[[], nn.Module]
-    "Whether Q/K/V linear layers in attention should have bias"
-    qkv_bias: bool
-
-    def __post_init__(self):
-        assert self.n_embed > 0
-        assert self.n_attention_heads > 0
-        assert self.vocab_size > 0
-        assert self.short_ctx_len > 0
-        assert self.internal_seq_len > 0
-        assert self.internal_seq_len > self.short_ctx_len
-        self.recurrent_seq_len = self.internal_seq_len - self.short_ctx_len
-        assert self.ff_dropout_p >= 0
-        assert self.ponder_loss_penalty >= 1
-        assert self.ponder_continue_penalty >= 0
-        assert self.resid_gate_multiplier > 0
-
-    @classmethod
-    def default(cls):
-        return cls(
-            n_embed=128,
-            n_attention_heads=8,
-            vocab_size=32000,
-            short_ctx_len=64,
-            internal_seq_len=256,
-            ff_dropout_p=0.0,
-            attn_dropout_p=0.0,
-            n_intermediate=4,
-            ponder_continue_penalty=10.0,
-            ponder_loss_penalty=1.1,
-            resid_gate_multiplier=2.0,
-            activation=torch.nn.LeakyReLU,
-            qkv_bias=True,
-        )
 
 class PartialCrossAttention(nn.Module):
     "Partial cross attention layer"
@@ -243,7 +178,8 @@ class RNNPonder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.norm = nn.LayerNorm((config.n_embed,))
-        self.intermediate = nn.ModuleList(IntermediateLayer(config) for _ in range(config.n_intermediate))
+        self.intermediate = nn.ModuleList(
+            IntermediateLayer(config) for _ in range(config.n_intermediate))
         self.output = OutputLayer(config)
 
     # recurrent is recurrent state, internal is output of input layer, or if
