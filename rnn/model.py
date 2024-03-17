@@ -33,20 +33,20 @@ class PartialCrossAttention(nn.Module):
         # transpose (batch, seq, n_heads, n_embed) -> (batch, n_heads, seq, n_embed) for sdp
         q = self.q_linear(internal) \
             .unflatten(-1, (self.n_attention_heads, self.n_embed)) \
-            .transpose(1, 2)
-        kv_seq = torch.concat((external, internal), dim=1)
+            .transpose(-2, -3)
+        kv_seq = torch.concat((external, internal), dim=-2)
         # kv_merged shape: (batch, seq, 2, n_heads, n_embed)
         kv_merged = self.kv_linear(kv_seq).unflatten(-1, (2, self.n_attention_heads, self.n_embed))
         # extract from merged
-        k = kv_merged[..., 0, :, :].transpose(1, 2)
-        v = kv_merged[..., 1, :, :].transpose(1, 2)
+        k = kv_merged[..., 0, :, :].transpose(-2, -3)
+        v = kv_merged[..., 1, :, :].transpose(-2, -3)
 
         # why does pylint think this isn't callable?
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
 
         # transpose back
-        return attn_out.transpose(1, 2)
+        return attn_out.transpose(-2, -3)
 
 class GatedFeedForward(nn.Module):
     "Feedforward after attention with residual gating"
@@ -116,15 +116,15 @@ class InputLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # ensure sequence is of correct length
-        assert x.shape[1] == self.short_ctx_len
+        assert x.shape[-1] == self.short_ctx_len
 
         qkv_merged: torch.Tensor = self.make_qkv(x)
         # extract q/k/v from merged
         # (batch, seq, n_heads, n_embed)
         # transpose to (batch, n_heads, seq, n_embed) for sdp
-        q = qkv_merged[..., 0, :, :].transpose(1, 2)
-        k = qkv_merged[..., 1, :, :].transpose(1, 2)
-        v = qkv_merged[..., 2, :, :].transpose(1, 2)
+        q = qkv_merged[..., 0, :, :].transpose(-2, -3)
+        k = qkv_merged[..., 1, :, :].transpose(-2, -3)
+        v = qkv_merged[..., 2, :, :].transpose(-2, -3)
 
         # apply rotary positional embedding on q/k
         q = self.rope(q)
@@ -135,7 +135,7 @@ class InputLayer(nn.Module):
 
         # transpose back (batch, seq, n_heads, n_embed), then ff
         # out shape is (batch, seq, n_embed)
-        return self.feedforward(attn_out.transpose(1, 2))
+        return self.feedforward(attn_out.transpose(-2, -3))
 
 class IntermediateLayer(nn.Module):
     "The intermediate layers(s) of the model"
@@ -231,17 +231,17 @@ class OutputDecode(nn.Module):
         kv_merged = self.kv_linear(recurrent) \
             .unflatten(-1, (2, self.n_attention_heads, self.n_embed))
         # extract and transpose for sdp
-        k = kv_merged[..., 0, :, :].transpose(1, 2)
-        v = kv_merged[..., 1, :, :].transpose(1, 2)
+        k = kv_merged[..., 0, :, :].transpose(-2, -3)
+        v = kv_merged[..., 1, :, :].transpose(-2, -3)
 
         # no dropout here
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
-        attn_out = attn_out.transpose(1, 2)
+        attn_out = attn_out.transpose(-2, -3)
         # (batch, "seq", n_heads, n_embed) -> (batch, n_embed)
-        token_out = self.out_feedforward(attn_out[:, 0, :, :])
+        token_out = self.out_feedforward(attn_out[..., 0, :, :])
         # -> (batch, 1)
-        p_halt_out = self.p_halt_feedforward(attn_out[:, 1, :, :])
+        p_halt_out = self.p_halt_feedforward(attn_out[..., 1, :, :])
 
         # out: (batch, vocab_size), (batch)
         return token_out, F.sigmoid(p_halt_out.squeeze(-1))

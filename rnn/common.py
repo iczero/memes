@@ -4,8 +4,8 @@ import warnings
 from collections.abc import Callable
 
 import numpy as np
-import sentencepiece as spm
 import zstandard
+from sentencepiece import SentencePieceProcessor
 from torch import nn
 
 
@@ -57,15 +57,18 @@ class ModelConfig:
     def default(cls):
         return cls(
             n_embed=128,
-            n_attention_heads=8,
+            n_attention_heads=4,
             vocab_size=32000,
-            short_ctx_len=32,
-            internal_seq_len=128,
+            short_ctx_len=16,
+            internal_seq_len=64,
             ff_dropout_p=0.0,
             attn_dropout_p=0.0,
-            n_intermediate=4,
-            ponder_continue_penalty=3.0,
-            ponder_loss_penalty=2.0,
+            n_intermediate=3,
+            #ponder_continue_penalty=6.0,
+            #ponder_loss_penalty=1.7,
+            # temporarily disable ponder
+            ponder_continue_penalty=5.0,
+            ponder_loss_penalty=1.0,
             resid_gate_multiplier=2.0,
             activation=nn.GELU,
             qkv_bias=True,
@@ -84,8 +87,8 @@ class TrainConfig:
     max_ponder_steps: int
     "Max steps the model may ponder for"
     # TODO: truncated BPTT or activation checkpointing or something
-    #max_steps: int
-    #"Max steps to run training"
+    max_steps_temp: int
+    "Max steps to run training (temporary)"
 
     @classmethod
     def default(cls):
@@ -93,8 +96,9 @@ class TrainConfig:
             lr=0.001,
             weight_decay=0.001,
             backspace_p=0.01,
-            batch_size=4,
+            batch_size=16,
             max_ponder_steps=8,
+            max_steps_temp=16,
         )
 
 def load_dataset(in_stream):
@@ -121,7 +125,7 @@ def random_token_not(total: int, not_token: int):
             return token
 
 def tokenize_input(
-    sp: spm.SentencePieceProcessor,
+    sp: SentencePieceProcessor,
     ctx_len: int,
     sequence: str,
     train=False,

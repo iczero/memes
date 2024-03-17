@@ -1,18 +1,19 @@
-from collections.abc import Iterable
 import dataclasses
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 import aim
-import safetensors
-import sentencepiece as spm
 import torch
-from torch import nn
 import torch.nn.functional as F
 import tqdm
+from safetensors.torch import save_model, load_model
+from sentencepiece import SentencePieceProcessor
+from torch import nn
 
 from .common import ModelConfig, TrainConfig, load_dataset, tokenize_input
 from .model import RNNSequence
+
 
 def dprint(*args):
     return
@@ -52,7 +53,7 @@ class Trainer:
     sequences: list[TrainSequence] = []
     model: RNNSequence
     recurrent: torch.Tensor
-    tokenizer: spm.SentencePieceProcessor
+    tokenizer: SentencePieceProcessor
     train_iter: Iterable[str]
     prev_internal: torch.Tensor | None
     "Previous batched internal state, if reusable"
@@ -63,7 +64,7 @@ class Trainer:
         self,
         model_config: ModelConfig,
         train_config: TrainConfig,
-        tokenizer: spm.SentencePieceProcessor,
+        tokenizer: SentencePieceProcessor,
         train_set: Path,
         device: torch.device,
         dtype: torch.dtype,
@@ -76,6 +77,7 @@ class Trainer:
         self.model = RNNSequence(model_config)
         self.model.type(self.dtype)
         self.model.to(self.device)
+        self.model.train()
 
         self.train_file = open(train_set, 'rb')
         self.train_iter = load_dataset(self.train_file)
@@ -232,14 +234,18 @@ def main():
     device = torch.device('cuda')
     dtype = torch.float32
 
+    #torch.autograd.set_detect_anomaly(True)
+
     model_config = ModelConfig.default()
     train_config = TrainConfig.default()
-    tokenizer = spm.SentencePieceProcessor()
+    tokenizer = SentencePieceProcessor()
     tokenizer.Init(model_file='data/tokenizer6.model')
 
     trainer = Trainer(model_config, train_config, tokenizer, train_set, device, dtype)
 
     model = trainer.model
+    #load_model(model, 'rnn.model')
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         train_config.lr,
@@ -256,18 +262,25 @@ def main():
         while not done:
             steps += 1
             done = trainer.forward_step()
-            if steps >= 64:
+            if steps >= train_config.max_steps_temp:
                 break
 
-        print('\nbatch:', batch)
         loss = trainer.sum_train_loss()
-        print('training loss:', loss.item())
-        print('unweighted loss:', trainer.sum_validation_loss().item())
+        show_loss = loss.item()
+        show_unweighted_loss = trainer.sum_validation_loss().item()
         loss.backward()
-        print('grad norm:', nn.utils.clip_grad_norm_(
-            model.parameters(), 2., error_if_nonfinite=True
-        ).item())
+        show_grads_norm = nn.utils.clip_grad_norm_(
+            model.parameters(), 3., error_if_nonfinite=True
+        ).item()
         optimizer.step()
+
+        print('\nbatch:', batch)
+        print('grad norm:', show_grads_norm)
+        print('training loss:', show_loss)
+        print('unweighted loss:', show_unweighted_loss)
+
+        if batch % 500 == 0:
+            save_model(model, 'rnn-test.model')
 
 if __name__ == '__main__':
     main()
