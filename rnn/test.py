@@ -1,23 +1,12 @@
-# does not actually test anything
-import torch
+import sys
+from .common import load_dataset
 
-from .model import RNNSequence, ModelConfig
+train_set = sys.argv[1]
+train_file = open(train_set, 'rb')
+train_iter = load_dataset(train_file)
 
-device = torch.device('cuda')
-
-config = ModelConfig.default()
-model = RNNSequence(config)
-model.type(torch.float32)
-model.to(device)
-
-text_input = torch.full((1, config.short_ctx_len), 3).to(device)
-
-internal = model.input(text_input)
-recurrent, internal = model.ponder(model.recurrent_init.clone().unsqueeze(0), internal)
-out_token, p_halt = model.decode(recurrent)
-
-print('out', out_token.softmax(-1))
-print('p_halt', p_halt)
-
-import time
-time.sleep(60)
+for i in range(1, 4390):
+    for j in range(32):
+        count, value = next(train_iter)
+        if i == 4388:
+            print('\n\n\n', count, '\n', repr(value))
