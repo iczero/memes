@@ -146,7 +146,11 @@ class Trainer:
         should_halt = p_halt_out.bernoulli().nonzero().flatten().tolist()
 
         # collect expected tokens
-        expected_tokens = [info.sequence[info.offset] for info in self.sequences]
+        expected_tokens = [
+            # next token
+            info.sequence[info.offset + self.model_config.short_ctx_len]
+            for info in self.sequences
+        ]
         expected_tokens = torch.tensor(expected_tokens, device=self.device)
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
         step_losses = ponder_loss(
@@ -178,8 +182,6 @@ class Trainer:
 
             if did_halt:
                 info.prev_internal = None
-                # slide shortctx to include next token
-                info.offset += 1
                 info.total_ponder = 0
                 info.p_not_halt.copy_(1.)
                 # record unweighted loss as well
@@ -187,7 +189,7 @@ class Trainer:
 
                 # check if sequence ended
                 # we end one token before the last otherwise there is no "next" token to train on
-                if info.offset + self.model_config.short_ctx_len > len(info.sequence) - 1:
+                if info.offset + self.model_config.short_ctx_len >= len(info.sequence) - 1:
                     info.ended = True
                     # introduce dummy internal sequence
                     info.prev_internal = torch.zeros((
@@ -195,6 +197,8 @@ class Trainer:
                         self.model_config.n_embed,
                     ), device=self.device, dtype=self.dtype)
                 else:
+                    # slide shortctx to include next token
+                    info.offset += 1
                     self.halted_sequences.append(i)
                     has_halt = True
             else:
@@ -252,7 +256,7 @@ def main():
         while not done:
             steps += 1
             done = trainer.forward_step()
-            if steps >= 16:
+            if steps >= 64:
                 break
 
         print('\nbatch:', batch)
