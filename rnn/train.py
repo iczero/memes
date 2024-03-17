@@ -295,11 +295,18 @@ def main():
         show_loss = loss.item()
         show_unweighted_loss = trainer.sum_validation_loss().item()
         loss.backward()
-        show_grads_norm = nn.utils.clip_grad_norm_(
-            model.parameters(), 3., error_if_nonfinite=True
-        ).item()
-        optimizer.step()
+        try:
+            show_grads_norm = nn.utils.clip_grad_norm_(
+                model.parameters(), 3., error_if_nonfinite=True
+            ).item()
+        except RuntimeError as e:
+            print('\nwarning: clip_grad_norm_ failed:', e)
+            print('  the current step will be skipped')
+            print('batch:', batch)
+            print('loss:', show_loss)
+            continue
 
+        optimizer.step()
         print('\nbatch:', batch)
         print('grad norm:', show_grads_norm)
         print('training loss:', show_loss)

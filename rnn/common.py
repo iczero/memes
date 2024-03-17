@@ -111,7 +111,9 @@ def load_dataset(in_stream):
         buffer[:] = lines[-1]
         for line in lines[0:-1]:
             obj = json.loads(line)
-            yield count, obj['text']
+            text = obj['text']
+            if len(text) > 0:
+                yield count, text
             count += 1
 
     if len(buffer) > 0:
