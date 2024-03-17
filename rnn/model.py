@@ -243,7 +243,7 @@ class OutputDecode(nn.Module):
         # -> (batch, 1)
         p_halt_out = self.p_halt_feedforward(attn_out[:, 1, :, :])
 
-        # out: (batch, n_embed), (batch)
+        # out: (batch, vocab_size), (batch)
         return token_out, F.sigmoid(p_halt_out.squeeze(-1))
 
 class RNNSequence(nn.Module):

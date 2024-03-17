@@ -11,34 +11,34 @@ from torch import nn
 
 @dataclasses.dataclass
 class ModelConfig:
-    "Embedding dimensions"
     n_embed: int
-    "Number of attention heads"
+    "Embedding dimensions"
     n_attention_heads: int
-    "Vocabulary size"
+    "Number of attention heads"
     vocab_size: int
-    "Length of input short context sequence"
+    "Vocabulary size"
     short_ctx_len: int
-    "Length of internal sequence"
+    "Length of input short context sequence"
     internal_seq_len: int
-    "Length of recurrent sequence"
+    "Length of internal sequence"
     recurrent_seq_len: int = dataclasses.field(init=False)
-    "Probability of dropout after feedforward"
+    "Length of recurrent sequence"
     ff_dropout_p: float
-    "Probability of dropout after attention"
+    "Probability of dropout after feedforward"
     attn_dropout_p: float
-    "Number of intermediate layers"
+    "Probability of dropout after attention"
     n_intermediate: int
-    "Ponder: static penalty for pondering"
+    "Number of intermediate layers"
     ponder_continue_penalty: float
-    "Ponder: penalty for halting with loss"
+    "Ponder: static penalty for pondering"
     ponder_loss_penalty: float
-    "Multiplier for residual gating"
+    "Ponder: penalty for halting with loss"
     resid_gate_multiplier: float
-    "Activation function"
+    "Multiplier for residual gating"
     activation: Callable[[], nn.Module]
-    "Whether Q/K/V linear layers in attention should have bias"
+    "Activation function"
     qkv_bias: bool
+    "Whether Q/K/V linear layers in attention should have bias"
 
     def __post_init__(self):
         assert self.n_embed > 0
@@ -57,13 +57,13 @@ class ModelConfig:
     def default(cls):
         return cls(
             n_embed=128,
-            n_attention_heads=8,
+            n_attention_heads=4,
             vocab_size=32000,
-            short_ctx_len=64,
-            internal_seq_len=256,
+            short_ctx_len=32,
+            internal_seq_len=128,
             ff_dropout_p=0.0,
             attn_dropout_p=0.0,
-            n_intermediate=4,
+            n_intermediate=3,
             ponder_continue_penalty=5.0,
             ponder_loss_penalty=1.5,
             resid_gate_multiplier=2.0,
@@ -73,17 +73,19 @@ class ModelConfig:
 
 @dataclasses.dataclass
 class TrainConfig:
-    "Learning rate"
     lr: float
-    "Weight decay"
+    "Learning rate"
     weight_decay: float
-    "Probability to introduce bad token and backspace"
+    "Weight decay"
     backspace_p: float
-    "Batch size"
+    "Probability to introduce bad token and backspace"
     batch_size: int
-    "Max steps to run training"
+    "Batch size"
+    max_ponder_steps: int
+    "Max steps the model may ponder for"
     # TODO: truncated BPTT or activation checkpointing or something
-    max_steps: int
+    #max_steps: int
+    #"Max steps to run training"
 
     @classmethod
     def default(cls):
@@ -91,8 +93,8 @@ class TrainConfig:
             lr=0.001,
             weight_decay=0.001,
             backspace_p=0.01,
-            batch_size=32,
-            max_steps=128,
+            batch_size=4,
+            max_ponder_steps=8,
         )
 
 def load_dataset(in_stream):
