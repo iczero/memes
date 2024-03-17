@@ -158,10 +158,13 @@ class OutputLayer(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.norm = nn.LayerNorm((config.n_embed,))
         self.attention = PartialCrossAttention(config)
         self.feedforward = GatedFeedForward(config)
 
     def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
+        # normalize internal from previous intermediate layer
+        internal = self.norm(internal)
         # we are computing residual to recurrent state, so "recurrent" is "internal"
         out = self.attention(internal, recurrent)
         out = self.feedforward(out)
@@ -200,6 +203,8 @@ class OutputDecode(nn.Module):
         super().__init__()
         self.n_attention_heads = config.n_attention_heads
         self.n_embed = config.n_embed
+
+        self.norm = nn.LayerNorm((config.n_embed,))
         # standard cross-attention scheme except queries are directly parameters
         self.q_out = nn.Parameter(torch.randn(config.n_embed))
         self.q_p_halt = nn.Parameter(torch.randn(config.n_embed))
@@ -228,6 +233,7 @@ class OutputDecode(nn.Module):
     def forward(self, recurrent: torch.Tensor):
         # (batch, "seq", n_embed)
         q = torch.stack((self.q_out, self.q_p_halt)).unsqueeze(0)
+        recurrent = self.norm(recurrent)
         kv_merged = self.kv_linear(recurrent) \
             .unflatten(-1, (2, self.n_attention_heads, self.n_embed))
         # extract and transpose for sdp

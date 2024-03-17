@@ -69,7 +69,7 @@ class ModelConfig:
             # temporarily disable ponder
             ponder_continue_penalty=5.0,
             ponder_loss_penalty=1.0,
-            resid_gate_multiplier=2.0,
+            resid_gate_multiplier=1.0,
             activation=nn.GELU,
             qkv_bias=True,
         )
@@ -96,7 +96,7 @@ class TrainConfig:
             lr=0.001,
             weight_decay=0.001,
             backspace_p=0.01,
-            batch_size=16,
+            batch_size=32,
             max_ponder_steps=8,
             max_steps_temp=16,
         )

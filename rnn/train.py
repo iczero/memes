@@ -15,6 +15,8 @@ from .common import ModelConfig, TrainConfig, load_dataset, tokenize_input
 from .model import RNNSequence
 
 
+DISABLE_TORCH_COMPILE = False
+
 def dprint(*args):
     return
     #print('debug:', *args)
@@ -106,6 +108,10 @@ class Trainer:
         self.prev_internal = None
         self.halted_sequences = list(range(batch_size))
 
+    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    def forward_input_batch(self, input_encode: torch.Tensor):
+        return self.model.input(input_encode)
+
     def prepare_internal_batch(self):
         short_ctx_len = self.model_config.short_ctx_len
         if len(self.halted_sequences) == 0 and self.prev_internal is not None:
@@ -133,27 +139,23 @@ class Trainer:
             if len(to_encode) > 0:
                 # run input batch
                 input_encode = torch.stack([v[1] for v in to_encode], dim=0)
-                input_encode = self.model.input(input_encode)
+                input_encode = self.forward_input_batch(input_encode)
                 # input_encode first dimension is batch
                 for item, encoded in zip(to_encode, input_encode):
                     internal_batch[item[0]] = encoded
 
             return torch.stack(internal_batch, dim=0)
 
-    def forward_step(self):
-        internal = self.prepare_internal_batch()
-        next_recurrent, next_internal = self.model.ponder(self.recurrent, internal)
-        self.recurrent = next_recurrent
+    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    def forward_ponder_batch(
+        self,
+        recurrent: torch.Tensor,
+        internal: torch.Tensor,
+        expected_tokens: torch.Tensor
+    ):
+        next_recurrent, next_internal = self.model.ponder(recurrent, internal)
         token_out, p_halt_out = self.model.decode(next_recurrent)
-        should_halt = p_halt_out.bernoulli().nonzero().flatten().tolist()
 
-        # collect expected tokens
-        expected_tokens = [
-            # next token
-            info.sequence[info.offset + self.model_config.short_ctx_len]
-            for info in self.sequences
-        ]
-        expected_tokens = torch.tensor(expected_tokens, device=self.device)
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
         step_losses = ponder_loss(
             cross_entropy,
@@ -162,6 +164,28 @@ class Trainer:
             self.model_config.ponder_loss_penalty
         )
 
+        with torch.no_grad():
+            should_halt = p_halt_out.bernoulli()
+
+        return next_recurrent, next_internal, token_out, p_halt_out, \
+            should_halt, cross_entropy, step_losses
+
+    def forward_step(self):
+        internal = self.prepare_internal_batch()
+        # collect expected tokens
+        expected_tokens = [
+            # next token
+            info.sequence[info.offset + self.model_config.short_ctx_len]
+            for info in self.sequences
+        ]
+        expected_tokens = torch.tensor(expected_tokens, device=self.device)
+
+        next_recurrent, next_internal, _token_out, p_halt_out, should_halt, \
+            cross_entropy, step_losses = \
+            self.forward_ponder_batch(self.recurrent, internal, expected_tokens)
+
+        should_halt = should_halt.nonzero().flatten().tolist()
+        self.recurrent = next_recurrent
         self.halted_sequences.clear()
         has_halt = False
         all_ended = True
@@ -235,6 +259,7 @@ def main():
     dtype = torch.float32
 
     #torch.autograd.set_detect_anomaly(True)
+    #torch.set_float32_matmul_precision('high')
 
     model_config = ModelConfig.default()
     train_config = TrainConfig.default()
@@ -252,6 +277,7 @@ def main():
         weight_decay=train_config.weight_decay
     )
     batch = 0
+
     while True:
         batch += 1
         optimizer.zero_grad()
@@ -279,8 +305,15 @@ def main():
         print('training loss:', show_loss)
         print('unweighted loss:', show_unweighted_loss)
 
+        #if batch == 50:
+        #    import IPython
+        #    IPython.embed()
+
         if batch % 500 == 0:
             save_model(model, 'rnn-test.model')
+
+        if batch >= 30_000:
+            return
 
 if __name__ == '__main__':
     main()

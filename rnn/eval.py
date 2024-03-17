@@ -44,7 +44,7 @@ class InferenceHelper:
         self.short_ctx.append(self.tokenizer['<s>'])
         self.recurrent = self.model.recurrent_init.clone()
 
-    def generate_tokens(self, limit = 500, max_ponder = 16):
+    def generate_tokens(self, limit = 100, max_ponder = 16):
         count = 0
         while count < limit:
             short_ctx = torch.tensor(self.short_ctx, dtype=torch.int32, device=self.device)
@@ -64,7 +64,7 @@ class InferenceHelper:
                     if count > limit:
                         return
                 else:
-                    print('ponder')
+                    #print('ponder')
                     ponder_count += 1
 
 
