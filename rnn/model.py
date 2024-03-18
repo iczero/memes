@@ -201,56 +201,42 @@ class OutputDecode(nn.Module):
     "Derive output token and ponder p_halt from recurrent state"
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.n_attention_heads = config.n_attention_heads
         self.n_embed = config.n_embed
 
         self.norm = nn.LayerNorm((config.n_embed,))
         # standard cross-attention scheme except queries are directly parameters
         self.q_out = nn.Parameter(torch.randn(config.n_embed))
-        self.q_p_halt = nn.Parameter(torch.randn(config.n_embed))
         self.kv_linear = nn.Linear(
             config.n_embed,
-            2 * config.n_attention_heads * config.n_embed,
+            2 * config.n_embed,
             bias=config.qkv_bias,
         )
 
-        ff_in_dim = config.n_embed * config.n_attention_heads
         self.out_feedforward = nn.Sequential(
-            nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(ff_in_dim, ff_in_dim),
+            nn.Linear(config.n_embed, config.n_embed),
             config.activation(),
-            nn.Linear(ff_in_dim, config.n_embed),
             nn.Linear(config.n_embed, config.vocab_size),
-        )
-
-        self.p_halt_feedforward = nn.Sequential(
-            nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(ff_in_dim, ff_in_dim),
-            config.activation(),
-            nn.Linear(ff_in_dim, 1), # p_halt
         )
 
     def forward(self, recurrent: torch.Tensor):
         # (batch, "seq", n_embed)
-        q = torch.stack((self.q_out, self.q_p_halt)).unsqueeze(0)
+        q = self.q_out.unsqueeze(0).unsqueeze(0)
         recurrent = self.norm(recurrent)
         kv_merged = self.kv_linear(recurrent) \
-            .unflatten(-1, (2, self.n_attention_heads, self.n_embed))
+            .unflatten(-1, (2, self.n_embed))
+        # kv_merged: (batch, "seq", k/v, n_embed)
         # extract and transpose for sdp
-        k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        k = kv_merged[..., 0, :]
+        v = kv_merged[..., 1, :]
 
         # no dropout here
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
-        attn_out = attn_out.transpose(-2, -3)
-        # (batch, "seq", n_heads, n_embed) -> (batch, n_embed)
-        token_out = self.out_feedforward(attn_out[..., 0, :, :])
-        # -> (batch, 1)
-        p_halt_out = self.p_halt_feedforward(attn_out[..., 1, :, :])
+        # (batch, "seq", n_embed) -> (batch, n_embed) -> (batch, vocab_size)
+        token_out = self.out_feedforward(attn_out[..., 0, :])
 
-        # out: (batch, vocab_size), (batch)
-        return token_out, F.sigmoid(p_halt_out.squeeze(-1))
+        # out: (batch, vocab_size)
+        return token_out
 
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):

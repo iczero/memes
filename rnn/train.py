@@ -114,37 +114,32 @@ class Trainer:
 
     def prepare_internal_batch(self):
         short_ctx_len = self.model_config.short_ctx_len
-        if len(self.halted_sequences) == 0 and self.prev_internal is not None:
-            # no previous steps have halted, can reuse internal
-            dprint('prepare_internal_batch: will reuse prev_internal')
-            return self.prev_internal
-        else:
-            # construct batch for input layer
-            to_encode: list[tuple[int, torch.Tensor]] = []
-            internal_batch: list[torch.Tensor | None] = []
-            for i, info in enumerate(self.sequences):
-                if info.prev_internal is not None:
-                    assert i not in self.halted_sequences
-                    internal_batch.append(info.prev_internal)
-                else:
-                    assert i in self.halted_sequences
-                    assert not info.ended
-                    # prepare batch for input layer
-                    short_ctx = info.sequence[info.offset : info.offset + short_ctx_len]
-                    short_ctx = torch.tensor(short_ctx, dtype=torch.int32, device=self.device)
-                    to_encode.append((i, short_ctx))
-                    # will be substitued later
-                    internal_batch.append(None)
+        input_list = []
+        output_list = []
+        for info in self.sequences:
+            # prepare batch for input layer
+            short_ctx = info.sequence[info.offset : info.offset + short_ctx_len]
+            short_ctx = torch.tensor(short_ctx, dtype=torch.int64, device=self.device)
+            input_list.append(short_ctx)
+            next_token = info.sequence[info.offset + short_ctx_len]
+            next_token = torch.tensor(next_token, dtype=torch.int64, device=self.device)
+            output_list.append(next_token)
 
-            if len(to_encode) > 0:
-                # run input batch
-                input_encode = torch.stack([v[1] for v in to_encode], dim=0)
-                input_encode = self.forward_input_batch(input_encode)
-                # input_encode first dimension is batch
-                for item, encoded in zip(to_encode, input_encode):
-                    internal_batch[item[0]] = encoded
+        input_array = torch.stack(input_list, dim=0)
+        input_array = self.forward_input_batch(input_array)
+        output_array = torch.stack(output_list, dim=0)
 
-            return torch.stack(internal_batch, dim=0)
+        # print('prepare_internal_batch(): sequences dump')
+        # for t_in, t_out in zip(input_list, output_list):
+        #     t_in = t_in.to('cpu').tolist()
+        #     t_out = t_out.item()
+        #     print(
+        #         repr(''.join(self.tokenizer.IdToPiece(p) for p in t_in)),
+        #         '->',
+        #         repr(self.tokenizer.IdToPiece(t_out))
+        #     )
+
+        return input_array, output_array
 
     @torch.compile(disable=DISABLE_TORCH_COMPILE)
     def forward_ponder_batch(
@@ -154,40 +149,21 @@ class Trainer:
         expected_tokens: torch.Tensor
     ):
         next_recurrent, next_internal = self.model.ponder(recurrent, internal)
-        token_out, p_halt_out = self.model.decode(next_recurrent)
+        token_out = self.model.decode(next_recurrent)
 
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
-        step_losses = ponder_loss(
-            cross_entropy,
-            p_halt_out,
-            self.model_config.ponder_continue_penalty,
-            self.model_config.ponder_loss_penalty
-        )
 
-        with torch.no_grad():
-            should_halt = p_halt_out.bernoulli()
-
-        return next_recurrent, next_internal, token_out, p_halt_out, \
-            should_halt, cross_entropy, step_losses
+        return next_recurrent, next_internal, token_out, None, \
+            None, cross_entropy, None
 
     def forward_step(self):
-        internal = self.prepare_internal_batch()
-        # collect expected tokens
-        expected_tokens = [
-            # next token
-            info.sequence[info.offset + self.model_config.short_ctx_len]
-            for info in self.sequences
-        ]
-        expected_tokens = torch.tensor(expected_tokens, device=self.device)
+        internal, expected_tokens = self.prepare_internal_batch()
 
-        next_recurrent, next_internal, _token_out, p_halt_out, should_halt, \
-            cross_entropy, step_losses = \
+        next_recurrent, _next_internal, _token_out, _, _, \
+            cross_entropy, _ = \
             self.forward_ponder_batch(self.recurrent, internal, expected_tokens)
 
-        should_halt = should_halt.nonzero().flatten().tolist()
         self.recurrent = next_recurrent
-        self.halted_sequences.clear()
-        has_halt = False
         all_ended = True
         for i, info in enumerate(self.sequences):
             if info.ended:
@@ -195,45 +171,15 @@ class Trainer:
                 continue
 
             all_ended = False
-            p_halt_detached = p_halt_out[i].clone().detach()
-            did_halt = i in should_halt
-            if not did_halt and info.total_ponder >= self.train_config.max_ponder_steps:
-                # force halt
-                p_halt_detached.copy_(1.)
-                did_halt = True
 
-            # P(halt | not previously halted) * ponder step loss
-            weighted_loss = info.p_not_halt * p_halt_detached * step_losses[i]
-            info.losses.append(weighted_loss)
-
-            if did_halt:
-                info.prev_internal = None
-                info.total_ponder = 0
-                info.p_not_halt.copy_(1.)
-                # record unweighted loss as well
-                info.halted_losses.append(cross_entropy[i])
-
-                # check if sequence ended
-                # we end one token before the last otherwise there is no "next" token to train on
-                if info.offset + self.model_config.short_ctx_len >= len(info.sequence) - 1:
-                    info.ended = True
-                    # introduce dummy internal sequence
-                    info.prev_internal = torch.zeros((
-                        self.model_config.short_ctx_len,
-                        self.model_config.n_embed,
-                    ), device=self.device, dtype=self.dtype)
-                else:
-                    # slide shortctx to include next token
-                    info.offset += 1
-                    self.halted_sequences.append(i)
-                    has_halt = True
+            # check if sequence ended
+            # we end one token before the last otherwise there is no "next" token to train on
+            if info.offset + self.model_config.short_ctx_len >= len(info.sequence) - 1:
+                info.ended = True
             else:
-                info.prev_internal = next_internal[i]
-                info.p_not_halt *= 1 - p_halt_detached
-                info.total_ponder += 1
-
-        # stash internal state if we can reuse it
-        self.prev_internal = next_internal if not has_halt else None
+                info.losses.append(cross_entropy[i])
+                # slide shortctx to include next token
+                info.offset += 1
 
         return all_ended
 
@@ -253,7 +199,7 @@ class Trainer:
 
 def main():
     in_path = Path(sys.argv[1])
-    validation_set = in_path / 'val.jsonl.zst'
+    #validation_set = in_path / 'val.jsonl.zst'
     train_set = in_path / 'train' / '00.jsonl.zst'
     device = torch.device('cuda')
     dtype = torch.float32
@@ -293,7 +239,7 @@ def main():
 
         loss = trainer.sum_train_loss()
         show_loss = loss.item()
-        show_unweighted_loss = trainer.sum_validation_loss().item()
+        #show_unweighted_loss = trainer.sum_validation_loss().item()
         loss.backward()
         try:
             show_grads_norm = nn.utils.clip_grad_norm_(
@@ -310,7 +256,7 @@ def main():
         print('\nbatch:', batch)
         print('grad norm:', show_grads_norm)
         print('training loss:', show_loss)
-        print('unweighted loss:', show_unweighted_loss)
+        #print('unweighted loss:', show_unweighted_loss)
 
         #if batch == 50:
         #    import IPython

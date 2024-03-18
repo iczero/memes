@@ -44,28 +44,20 @@ class InferenceHelper:
         self.short_ctx.append(self.tokenizer['<s>'])
         self.recurrent = self.model.recurrent_init.clone()
 
-    def generate_tokens(self, limit = 100, max_ponder = 16):
+    def generate_tokens(self, limit = 100, _max_ponder = 16):
         count = 0
         while count < limit:
             short_ctx = torch.tensor(self.short_ctx, dtype=torch.int32, device=self.device)
             internal = self.model.input(short_ctx)
-            halt = False
-            ponder_count = 0
-            while not halt:
-                self.recurrent, internal = self.model.ponder(self.recurrent, internal)
-                token_logits, p_halt = self.model.decode(self.recurrent)
-                halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count > max_ponder
-                if halt:
-                    token = token_logits.argmax(dim=-1).item()
-                    self.short_ctx.append(token)
-                    del self.short_ctx[0]
-                    count += 1
-                    yield token
-                    if count > limit:
-                        return
-                else:
-                    #print('ponder')
-                    ponder_count += 1
+            self.recurrent, internal = self.model.ponder(self.recurrent, internal)
+            token_logits = self.model.decode(self.recurrent)
+            token = token_logits.argmax(dim=-1).item()
+            self.short_ctx.append(token)
+            del self.short_ctx[0]
+            count += 1
+            yield token
+            if count > limit:
+                return
 
 
 def main():
