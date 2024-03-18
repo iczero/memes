@@ -218,11 +218,11 @@ class OutputDecode(nn.Module):
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
-    def forward(self, recurrent: torch.Tensor):
+    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
         # (batch, "seq", n_embed)
         q = self.q_out.unsqueeze(0).unsqueeze(0)
-        recurrent = self.norm(recurrent)
-        kv_merged = self.kv_linear(recurrent) \
+        sequence = self.norm(torch.concat((recurrent, internal), dim=-2))
+        kv_merged = self.kv_linear(sequence) \
             .unflatten(-1, (2, self.n_embed))
         # kv_merged: (batch, "seq", k/v, n_embed)
         # extract and transpose for sdp

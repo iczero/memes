@@ -50,7 +50,7 @@ class InferenceHelper:
             short_ctx = torch.tensor(self.short_ctx, dtype=torch.int32, device=self.device)
             internal = self.model.input(short_ctx)
             self.recurrent, internal = self.model.ponder(self.recurrent, internal)
-            token_logits = self.model.decode(self.recurrent)
+            token_logits = self.model.decode(self.recurrent, internal)
             token = token_logits.argmax(dim=-1).item()
             self.short_ctx.append(token)
             del self.short_ctx[0]
@@ -58,7 +58,6 @@ class InferenceHelper:
             yield token
             if count > limit:
                 return
-
 
 def main():
     # TODO: save this to serialized model or something

@@ -149,7 +149,7 @@ class Trainer:
         expected_tokens: torch.Tensor
     ):
         next_recurrent, next_internal = self.model.ponder(recurrent, internal)
-        token_out = self.model.decode(next_recurrent)
+        token_out = self.model.decode(next_recurrent, next_internal)
 
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
 
