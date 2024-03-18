@@ -91,8 +91,7 @@ class TrainConfig:
     "Batch size"
     max_ponder_steps: int
     "Max steps the model may ponder for"
-    # TODO: truncated BPTT or activation checkpointing or something
-    max_steps_temp: int
+    truncate_steps: int
     "Max steps to run training (temporary)"
 
     @classmethod
@@ -101,9 +100,9 @@ class TrainConfig:
             lr=0.001,
             weight_decay=0.001,
             backspace_p=0.01,
-            batch_size=32,
-            max_ponder_steps=8,
-            max_steps_temp=32,
+            batch_size=16,
+            max_ponder_steps=4,
+            truncate_steps=96,
         )
 
 def load_dataset(in_stream):

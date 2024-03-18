@@ -195,13 +195,13 @@ class Trainer:
         should_halt = should_halt.nonzero().flatten().tolist()
         self.recurrent = next_recurrent
         self.halted_sequences.clear()
-        all_ended = True
+        ended_count = 0
         for i, info in enumerate(self.sequences):
             if info.ended:
                 # skip finished sequences
+                ended_count += 1
                 continue
 
-            all_ended = False
             p_halt_detached = p_halt_out[i].clone().detach()
             did_halt = i in should_halt
             if not did_halt and info.total_ponder >= self.train_config.max_ponder_steps:
@@ -241,26 +241,43 @@ class Trainer:
                 info.p_not_halt *= 1 - p_halt_detached
                 info.total_ponder += 1
 
-        return all_ended
+        return ended_count
+
+    def truncate_backprop(self):
+        "Detaches recurrent state and clears losses"
+        self.recurrent = self.recurrent.detach()
+        for info in self.sequences:
+            info.losses.clear()
+            info.halted_losses.clear()
+            if info.prev_internal is not None:
+                info.prev_internal = info.prev_internal.detach()
 
     def sum_train_loss(self) -> torch.Tensor:
         sequence_losses = []
         for info in self.sequences:
-            sequence_losses.append(torch.stack(info.losses).sum() / info.offset)
+            if len(info.losses) == 0:
+                assert info.ended
+                continue
 
-        return torch.stack(sequence_losses).sum() / len(self.sequences)
+            sequence_losses.append(torch.stack(info.losses).sum() / len(info.losses))
+
+        return torch.stack(sequence_losses).sum() / len(sequence_losses)
 
     def sum_validation_loss(self) -> torch.Tensor:
         sequence_losses = []
         for info in self.sequences:
-            sequence_losses.append(torch.stack(info.halted_losses).sum() / info.offset)
+            if len(info.halted_losses) == 0:
+                assert info.ended
+                continue
 
-        return torch.stack(sequence_losses).sum() / len(self.sequences)
+            sequence_losses.append(torch.stack(info.halted_losses).sum() / len(info.halted_losses))
+
+        return torch.stack(sequence_losses).sum() / len(sequence_losses)
 
 def main():
     in_path = Path(sys.argv[1])
     #validation_set = in_path / 'val.jsonl.zst'
-    train_set = in_path / 'train' / '01.jsonl.zst'
+    train_set = in_path / 'train' / '02.jsonl.zst'
     device = torch.device('cuda')
     dtype = torch.float32
 
@@ -292,23 +309,28 @@ def main():
     run['train_config'] = dataclasses.asdict(train_config)
 
     batch = 0
+    step = 0
+    done_count = train_config.batch_size
+    done_threshold = train_config.batch_size // 3 * 2
     while True:
-        batch += 1
+        step += 1
         optimizer.zero_grad()
 
-        trainer.next_batch()
-        done = False
-        steps = 0
-        while not done:
-            steps += 1
-            done = trainer.forward_step()
-            if steps >= train_config.max_steps_temp:
-                break
+        if done_count >= done_threshold:
+            batch += 1
+            trainer.next_batch()
 
-        loss = trainer.sum_train_loss()
-        show_loss = loss.item()
-        show_unweighted_loss = trainer.sum_validation_loss().item()
-        loss.backward()
+        backprop_steps = 0
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            while backprop_steps < train_config.truncate_steps:
+                done_count = trainer.forward_step()
+                backprop_steps += 1
+
+            loss = trainer.sum_train_loss()
+            show_loss = loss.item()
+            show_unweighted_loss = trainer.sum_validation_loss().item()
+            loss.backward()
+
         try:
             show_grads_norm = nn.utils.clip_grad_norm_(
                 model.parameters(), 3., error_if_nonfinite=True
@@ -316,19 +338,21 @@ def main():
         except RuntimeError as e:
             print('\nwarning: clip_grad_norm_ failed:', e)
             print('  the current step will be skipped')
-            print('batch:', batch)
+            print('batch:', step)
             print('loss:', show_loss)
             continue
 
         optimizer.step()
-        print('\nbatch:', batch)
+        print('\nstep:', step, 'batch:', batch)
         print('grad norm:', show_grads_norm)
         print('training loss:', show_loss)
         print('unweighted loss:', show_unweighted_loss)
-        run.track(show_loss, name='loss', step=batch)
-        run.track(show_grads_norm, name='grad_norm', step=batch)
+        run.track(show_loss, name='loss', step=step)
+        run.track(show_grads_norm, name='grad_norm', step=step)
 
-        if batch % 500 == 0:
+        trainer.truncate_backprop()
+
+        if step % 500 == 0:
             save_model(model, 'rnn-test.model')
 
 if __name__ == '__main__':
