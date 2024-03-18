@@ -3,7 +3,7 @@ import json
 import warnings
 from collections.abc import Callable
 
-import numpy as np
+import torch
 import zstandard
 from sentencepiece import SentencePieceProcessor
 from torch import nn
@@ -122,7 +122,7 @@ def load_dataset(in_stream):
 def random_token_not(total: int, not_token: int):
     "Generate a random token id that is not the provided token"
     while True:
-        token = np.random.randint(0, total)
+        token = torch.randint(0, total, tuple()).item()
         if token != not_token:
             return token
 
@@ -130,23 +130,8 @@ def tokenize_input(
     sp: SentencePieceProcessor,
     ctx_len: int,
     sequence: str,
-    train=False,
-    backspace_p: float | None = None,
 ):
     pad_start = [sp['<pad>']] * (ctx_len - 1) + [sp['<s>']]
     last = [sp['</s>']]
-    total_tokens = len(sp)
     encoded = sp.encode(sequence, out_type=int)
-
-    if train:
-        # randomly intersperse bad tokens and backspace
-        where_backspace, = np.random.poisson(backspace_p, len(encoded)).nonzero()
-        offset = 0
-        for index in where_backspace:
-            index += offset
-            next_token = encoded[index]
-            rand_token = random_token_not(total_tokens, next_token)
-            encoded[index:index] = [rand_token, sp['<del>']]
-            offset += 2
-
     return pad_start + encoded + last

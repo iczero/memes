@@ -7,13 +7,13 @@ import aim
 import torch
 import torch.nn.functional as F
 import tqdm
-from safetensors.torch import save_model, load_model
+from safetensors.torch import load_model, save_model
 from sentencepiece import SentencePieceProcessor
 from torch import nn
 
-from .common import ModelConfig, TrainConfig, load_dataset, tokenize_input
+from .common import (ModelConfig, TrainConfig, load_dataset, random_token_not,
+                     tokenize_input)
 from .model import RNNSequence
-
 
 DISABLE_TORCH_COMPILE = False
 
@@ -46,6 +46,8 @@ class TrainSequence:
     "Previous internal state, if not halted"
     total_ponder: int = 0
     "Total number of steps repeated for ponder at this offset"
+    was_backspace: bool = False
+    "If the last token was randomized for backspace"
 
 class Trainer:
     model_config: ModelConfig
@@ -86,13 +88,7 @@ class Trainer:
     def next_sequence(self) -> list[int]:
         # TODO: what if this implodes
         count, seq = next(self.train_iter)
-        return tokenize_input(
-            self.tokenizer,
-            self.model_config.short_ctx_len,
-            seq,
-            train=True,
-            backspace_p=self.train_config.backspace_p
-        )
+        return tokenize_input(self.tokenizer, self.model_config.short_ctx_len, seq)
 
     def next_batch(self):
         batch_size = self.train_config.batch_size
@@ -125,13 +121,22 @@ class Trainer:
                 assert not info.ended
                 # prepare batch for input layer
                 short_ctx = info.sequence[info.offset : info.offset + short_ctx_len]
+                if info.offset > 4 and torch.bernoulli(
+                    torch.tensor(self.train_config.backspace_p)
+                ).item() > 0:
+                    short_ctx[-1] = random_token_not(len(self.tokenizer), short_ctx[-1])
+                    info.offset -= 1
+                    info.was_backspace = True
                 short_ctx = torch.tensor(short_ctx, dtype=torch.int64, device=self.device)
                 input_batch.append((i, short_ctx))
                 # will be substitued later
                 input_sequences.append(None)
 
             # grab next token
-            next_token = info.sequence[info.offset + short_ctx_len]
+            if info.was_backspace:
+                next_token = self.tokenizer['<del>']
+            else:
+                next_token = info.sequence[info.offset + short_ctx_len]
             next_token = torch.tensor(next_token, dtype=torch.int64, device=self.device)
             output_list.append(next_token)
 
@@ -231,7 +236,10 @@ class Trainer:
                     ), device=self.device, dtype=self.dtype)
                 else:
                     # slide shortctx to include next token
-                    info.offset += 1
+                    if not info.was_backspace:
+                        info.offset += 1
+                    else:
+                        info.was_backspace = False
                     self.halted_sequences.append(i)
             else:
                 info.prev_internal = next_internal[i]
