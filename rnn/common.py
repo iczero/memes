@@ -57,8 +57,8 @@ class ModelConfig:
     def default(cls):
         return cls(
             n_embed=128,
-            n_attention_heads=4,
-            vocab_size=32000,
+            n_attention_heads=8,
+            vocab_size=16000,
             short_ctx_len=16,
             internal_seq_len=64,
             ff_dropout_p=0.0,
@@ -69,10 +69,15 @@ class ModelConfig:
             # temporarily disable ponder
             ponder_continue_penalty=5.0,
             ponder_loss_penalty=1.0,
-            resid_gate_multiplier=1.0,
-            activation=nn.GELU,
+            resid_gate_multiplier=2.0,
+            activation='gelu',
             qkv_bias=True,
         )
+
+    def get_activation(self):
+        return {
+            'gelu': nn.GELU(),
+        }[self.activation]
 
 @dataclasses.dataclass
 class TrainConfig:
@@ -98,7 +103,7 @@ class TrainConfig:
             backspace_p=0.01,
             batch_size=32,
             max_ponder_steps=8,
-            max_steps_temp=16,
+            max_steps_temp=32,
         )
 
 def load_dataset(in_stream):

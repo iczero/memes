@@ -6,7 +6,6 @@ from pathlib import Path
 import aim
 import torch
 import torch.nn.functional as F
-import tqdm
 from safetensors.torch import load_model, save_model
 from sentencepiece import SentencePieceProcessor
 from torch import nn
@@ -16,10 +15,6 @@ from .common import (ModelConfig, TrainConfig, load_dataset, random_token_not,
 from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
-
-def dprint(*args):
-    return
-    #print('debug:', *args)
 
 @torch.jit.script
 def ponder_loss(
@@ -265,30 +260,38 @@ class Trainer:
 def main():
     in_path = Path(sys.argv[1])
     #validation_set = in_path / 'val.jsonl.zst'
-    train_set = in_path / 'train' / '00.jsonl.zst'
+    train_set = in_path / 'train' / '01.jsonl.zst'
     device = torch.device('cuda')
     dtype = torch.float32
 
     #torch.autograd.set_detect_anomaly(True)
-    #torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision('high')
 
     model_config = ModelConfig.default()
     train_config = TrainConfig.default()
     tokenizer = SentencePieceProcessor()
-    tokenizer.Init(model_file='data/tokenizer6.model')
+    tokenizer.Init(model_file='data/tokenizer7.model')
 
     trainer = Trainer(model_config, train_config, tokenizer, train_set, device, dtype)
 
     model = trainer.model
-    #load_model(model, 'rnn.model')
+    try:
+        # TODO: save hyperparameters and training progress to the checkpoint
+        load_model(model, 'rnn-load.model')
+    except FileNotFoundError:
+        print('warning: could not find file to load')
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         train_config.lr,
         weight_decay=train_config.weight_decay
     )
-    batch = 0
 
+    run = aim.Run()
+    run['model_config'] = dataclasses.asdict(model_config)
+    run['train_config'] = dataclasses.asdict(train_config)
+
+    batch = 0
     while True:
         batch += 1
         optimizer.zero_grad()
@@ -322,16 +325,11 @@ def main():
         print('grad norm:', show_grads_norm)
         print('training loss:', show_loss)
         print('unweighted loss:', show_unweighted_loss)
-
-        #if batch == 50:
-        #    import IPython
-        #    IPython.embed()
+        run.track(show_loss, name='loss', step=batch)
+        run.track(show_grads_norm, name='grad_norm', step=batch)
 
         if batch % 500 == 0:
             save_model(model, 'rnn-test.model')
-
-        if batch >= 30_000:
-            return
 
 if __name__ == '__main__':
     main()

@@ -50,12 +50,22 @@ def main():
         sentence_iterator=generate_sentences(),
         model_type='unigram',
         model_prefix=out_prefix,
-        vocab_size=32000,
+        vocab_size=16000,
         max_sentence_length=16384,
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,
         normalization_rule_name='nfkc',
         byte_fallback=True,
+        character_coverage=0.995,
+        # force characters to exist, or character_coverage will disappear them
+        required_chars=''.join([
+            '0123456789',
+            'abcdefghijklmnopqrstuvwxyz',
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+            '`~!@#$%^&*-_=+|()[]{}<>.,:;/?"\'\\\n\t',
+            # misc unicode chars that might be common
+            '°‘’“”',
+        ]),
         # enable all special tokens
         unk_id=0,
         bos_id=1,

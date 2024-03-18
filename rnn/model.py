@@ -63,7 +63,7 @@ class GatedFeedForward(nn.Module):
             # concat all heads
             nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(in_len, in_len),
-            config.activation(),
+            config.get_activation(),
             nn.Linear(in_len, out_len),
         )
         self.dropout = nn.Dropout(config.ff_dropout_p)
@@ -109,7 +109,7 @@ class InputLayer(nn.Module):
             # concat heads
             nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(ff_in_dim, ff_in_dim),
-            config.activation(),
+            config.get_activation(),
             nn.Linear(ff_in_dim, config.n_embed),
             nn.Dropout(config.ff_dropout_p),
         )
@@ -222,13 +222,13 @@ class OutputDecode(nn.Module):
 
         self.ff_out = nn.Sequential(
             nn.Linear(config.n_embed, config.n_embed),
-            config.activation(),
+            config.get_activation(),
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
         self.ff_halt = nn.Sequential(
             nn.Linear(config.n_embed, config.n_embed),
-            config.activation(),
+            config.get_activation(),
             nn.Linear(config.n_embed, 1), # p_halt
         )
 
