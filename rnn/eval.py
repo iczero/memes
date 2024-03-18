@@ -53,7 +53,7 @@ class InferenceHelper:
             ponder_count = 0
             while not halt:
                 self.recurrent, internal = self.model.ponder(self.recurrent, internal)
-                token_logits, p_halt = self.model.decode(self.recurrent)
+                token_logits, p_halt = self.model.decode(self.recurrent, internal)
                 halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count > max_ponder
                 if halt:
                     token = token_logits.argmax(dim=-1).item()
@@ -64,7 +64,7 @@ class InferenceHelper:
                     if count > limit:
                         return
                 else:
-                    #print('ponder')
+                    print('ponder', ponder_count)
                     ponder_count += 1
 
 

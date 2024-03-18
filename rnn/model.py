@@ -201,53 +201,65 @@ class OutputDecode(nn.Module):
     "Derive output token and ponder p_halt from recurrent state"
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.n_attention_heads = config.n_attention_heads
         self.n_embed = config.n_embed
 
         self.norm = nn.LayerNorm((config.n_embed,))
+
         # standard cross-attention scheme except queries are directly parameters
         self.q_out = nn.Parameter(torch.randn(config.n_embed))
-        self.q_p_halt = nn.Parameter(torch.randn(config.n_embed))
-        self.kv_linear = nn.Linear(
+        self.kv_linear_out = nn.Linear(
             config.n_embed,
-            2 * config.n_attention_heads * config.n_embed,
+            2 * config.n_embed,
             bias=config.qkv_bias,
         )
 
-        ff_in_dim = config.n_embed * config.n_attention_heads
-        self.out_feedforward = nn.Sequential(
-            nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(ff_in_dim, ff_in_dim),
+        self.q_halt = nn.Parameter(torch.randn(config.n_embed))
+        self.kv_linear_halt = nn.Linear(
+            config.n_embed,
+            2 * config.n_embed,
+            bias=config.qkv_bias,
+        )
+
+        self.ff_out = nn.Sequential(
+            nn.Linear(config.n_embed, config.n_embed),
             config.activation(),
-            nn.Linear(ff_in_dim, config.n_embed),
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
-        self.p_halt_feedforward = nn.Sequential(
-            nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(ff_in_dim, ff_in_dim),
+        self.ff_halt = nn.Sequential(
+            nn.Linear(config.n_embed, config.n_embed),
             config.activation(),
-            nn.Linear(ff_in_dim, 1), # p_halt
+            nn.Linear(config.n_embed, 1), # p_halt
         )
 
-    def forward(self, recurrent: torch.Tensor):
-        # (batch, "seq", n_embed)
-        q = torch.stack((self.q_out, self.q_p_halt)).unsqueeze(0)
-        recurrent = self.norm(recurrent)
-        kv_merged = self.kv_linear(recurrent) \
-            .unflatten(-1, (2, self.n_attention_heads, self.n_embed))
-        # extract and transpose for sdp
-        k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        v = kv_merged[..., 1, :, :].transpose(-2, -3)
+    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
+        sequence = self.norm(torch.concat((recurrent, internal), dim=-2))
+        # -> (batch, seq, n_embed)
+
+        q = torch.stack((
+            self.q_out.unsqueeze(0),
+            self.q_halt.unsqueeze(0),
+        ), dim=0).unsqueeze(0)
+        # -> (batch, out/halt, "seq", n_embed)
+
+        kv_merged = torch.stack((
+            self.kv_linear_out(sequence).unflatten(-1, (2, self.n_embed)),
+            self.kv_linear_halt(sequence).unflatten(-1, (2, self.n_embed)),
+        ), dim=-4)
+        # kv_merged: (batch, out/halt, seq, k/v, n_embed)
+        # extract k/v for sdp
+        k = kv_merged[..., 0, :]
+        v = kv_merged[..., 1, :]
+        # -> (batch, out/halt, seq, n_embed)
 
         # no dropout here
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
-        attn_out = attn_out.transpose(-2, -3)
-        # (batch, "seq", n_heads, n_embed) -> (batch, n_embed)
-        token_out = self.out_feedforward(attn_out[..., 0, :, :])
+
+        # (batch, out/halt, "seq", n_embed) -> (batch, n_embed)
+        token_out = self.ff_out(attn_out[..., 0, 0, :])
         # -> (batch, 1)
-        p_halt_out = self.p_halt_feedforward(attn_out[..., 1, :, :])
+        p_halt_out = self.ff_halt(attn_out[..., 1, 0, :])
 
         # out: (batch, vocab_size), (batch)
         return token_out, F.sigmoid(p_halt_out.squeeze(-1))
