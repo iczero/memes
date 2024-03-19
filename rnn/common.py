@@ -82,9 +82,12 @@ class ModelConfig:
         return dataclasses.asdict(self)
 
     def get_activation(self):
-        return {
-            'gelu': nn.GELU(),
-        }[self.activation]
+        if self.activation == 'gelu':
+            return nn.GELU()
+        if self.activation == 'relu':
+            return nn.ReLU()
+        if self.activation == 'leakyrelu':
+            return nn.LeakyReLU()
 
     def get_dtype(self):
         return {
@@ -109,7 +112,7 @@ class TrainConfig:
     min_p_halt: float
     "Minimum value for p_halt during training"
     ponder_target_loss: float
-    "Percentile (from 0 to 1) to target as midpoint for pondering"
+    "Standard deviations over mean to target ponder loss"
     optimizer: str
     "Optimizer to use"
 

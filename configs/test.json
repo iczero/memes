@@ -24,7 +24,7 @@
     "truncate_steps": 96,
     "clip_grad_norm": 2.0,
     "min_p_halt": 0.4,
-    "ponder_target_loss": 1.0,
+    "ponder_target_loss": 1.04,
     "optimizer": "AdamW"
   }
 }

@@ -4,6 +4,7 @@ import sys
 from collections.abc import Iterable
 
 import aim
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch._dynamo.config
@@ -217,7 +218,7 @@ class TrainHelper:
                 continue
 
             p_halt_detached: torch.Tensor = torch.max(
-                p_halt_out[i].to('cpu').clone().detach(),
+                p_halt_out[i].clone().detach().to('cpu'),
                 torch.tensor(self.train_config.min_p_halt, device='cpu'),
             )
             did_halt = p_halt_detached.bernoulli() > 0
@@ -230,7 +231,7 @@ class TrainHelper:
                 info.prev_internal = None
                 info.p_not_halt.copy_(1.)
                 # record unweighted loss as well
-                info.halted_losses.append(cross_entropy[i])
+                info.halted_losses.append(cross_entropy[i].clone().detach().to('cpu'))
 
                 # check if sequence ended
                 # we end one token before the last otherwise there is no "next" token to train on
@@ -281,7 +282,11 @@ class TrainHelper:
                 assert info.ended
                 continue
 
-            sequence_losses.append(torch.stack(info.halted_losses).sum() / len(info.halted_losses))
+            seq_mean = torch.stack(info.halted_losses).sum() / len(info.halted_losses)
+            sequence_losses.append(seq_mean)
+            self.prev_unweighted_losses.append(seq_mean.item())
+            if len(self.prev_unweighted_losses) > PONDER_ADJUST_LOOKBACK * 2:
+                self.prev_unweighted_losses = self.prev_unweighted_losses[PONDER_ADJUST_LOOKBACK:]
 
         return torch.stack(sequence_losses).sum() / len(sequence_losses)
 
@@ -297,16 +302,12 @@ class TrainHelper:
             error_if_nonfinite=True,
         ).item()
 
-        self.prev_unweighted_losses.append(unweighted_loss_f)
-        if len(self.prev_unweighted_losses) > PONDER_ADJUST_LOOKBACK:
-            self.prev_unweighted_losses.pop(0)
-
         return train_loss_f, unweighted_loss_f, grads_norm_f
 
     def adjust_ponder_params(self):
-        sorted_losses = sorted(self.prev_unweighted_losses)
-        median_index = (len(sorted_losses) - 1) * self.train_config.ponder_target_loss
-        target_loss = sorted_losses[round(median_index)]
+        mean = np.mean(self.prev_unweighted_losses)
+        stdev = np.std(self.prev_unweighted_losses)
+        target_loss = mean + stdev * self.train_config.ponder_target_loss
         print('adjust_ponder_params(): selecting target loss', target_loss)
         self.model_config.ponder_loss_penalty = \
             (self.model_config.ponder_continue_penalty + target_loss) / target_loss
@@ -332,6 +333,8 @@ def main():
     subcommand = sys.argv[1]
     # optimizer state to load, if any
     load_optimizer_state = None
+    step = 0
+
     if subcommand == 'new':
         config_path = sys.argv[2]
         checkpoint_path = sys.argv[3]
@@ -354,6 +357,8 @@ def main():
             train_iter=None, # placeholder
         )
         trainer.aim_run = aim.Run()
+        trainer.aim_run['model_config'] = model_config.to_dict()
+        trainer.aim_run['train_config'] = train_config.to_dict()
 
     elif subcommand == 'load':
         checkpoint_path = sys.argv[2]
@@ -380,6 +385,10 @@ def main():
 
         if 'optimizer_state' in loaded:
             load_optimizer_state = loaded['optimizer_state']
+
+        if 'last_step' in loaded:
+            step = loaded['last_step']
+
     else:
         print('unknown subcommand:', subcommand)
         return
@@ -394,27 +403,28 @@ def main():
         print('loading optimizer state')
         optimizer.load_state_dict(load_optimizer_state)
 
+    batch = 0
+    done_count = train_config.batch_size
+    done_threshold = train_config.batch_size // 3 * 2
+
     def save_checkpoint(save_to: str):
         state = {
             'model_config': model_config.to_dict(),
             'train_config': train_config.to_dict(),
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
+            'last_step': step
         }
         if trainer.aim_run is not None:
             state['run_hash'] = trainer.aim_run.hash
 
         torch.save(state, save_to)
 
-    batch = 0
-    step = 0
-    done_count = train_config.batch_size
-    done_threshold = train_config.batch_size // 3 * 2
     while True:
         step += 1
         optimizer.zero_grad()
 
-        if done_count >= done_threshold:
+        if done_count >= done_threshold or True:
             batch += 1
             trainer.next_batch()
 
@@ -436,7 +446,7 @@ def main():
         optimizer.step()
         trainer.truncate_backprop()
 
-        if step % 25 == 0 and step > PONDER_ADJUST_LOOKBACK:
+        if step % 25 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
             ponder_loss_penalty = trainer.adjust_ponder_params()
             print('adjusted ponder loss penalty', ponder_loss_penalty)
             trainer.track(ponder_loss_penalty, name='ponder_loss_penalty', step=step)

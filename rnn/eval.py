@@ -1,10 +1,8 @@
 import sys
 
 import torch
-from safetensors.torch import load_model
 from sentencepiece import SentencePieceProcessor
 
-from .common import safetensors_load_metadata
 from .model import ModelConfig, RNNSequence
 
 
@@ -74,7 +72,7 @@ class InferenceHelper:
             if halt:
                 return token_logits
 
-            print('ponder', ponder_count)
+            print('<ponder>', end='', flush=True)
             ponder_count += 1
 
     def generate_tokens(self, limit = 256, max_ponder = 16, temperature = 1.0):
@@ -103,10 +101,10 @@ class InferenceHelper:
 def main():
     # TODO: save this to serialized model or something
     checkpoint_file = sys.argv[1]
-    metadata = safetensors_load_metadata(checkpoint_file)
-    config = ModelConfig.from_dict(metadata['model_config'])
+    loaded = torch.load(checkpoint_file)
+    config = ModelConfig.from_dict(loaded['model_config'])
     model = RNNSequence(config)
-    load_model(model, checkpoint_file)
+    model.load_state_dict(loaded['model_state'])
     dtype = config.get_dtype()
     device = torch.device('cuda')
     # needed to fix rope
@@ -117,12 +115,15 @@ def main():
 
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)
+        print('input context: ', end='', flush=True)
         infer.feed([tokenizer['<s>']])
         if len(sys.argv) > 2:
             content = tokenizer.Encode(sys.argv[2])
-            infer.feed(content)
+            for token in content:
+                print(tokenizer.IdToPiece(token), end='', flush=True)
+                infer.feed([token])
 
-        print('current context:', tokenizer.Decode(infer.current_context().tolist()))
+        print('\n\ngenerated:')
 
         for token in infer.generate_tokens():
             print(tokenizer.IdToPiece(token), end='', flush=True)
