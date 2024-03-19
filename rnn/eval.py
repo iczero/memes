@@ -4,6 +4,7 @@ import torch
 from safetensors.torch import load_model
 from sentencepiece import SentencePieceProcessor
 
+from .common import safetensors_load_metadata
 from .model import ModelConfig, RNNSequence
 
 
@@ -101,16 +102,18 @@ class InferenceHelper:
 
 def main():
     # TODO: save this to serialized model or something
-    config = ModelConfig.default()
+    checkpoint_file = sys.argv[1]
+    metadata = safetensors_load_metadata(checkpoint_file)
+    config = ModelConfig.from_dict(metadata['model_config'])
     model = RNNSequence(config)
-    load_model(model, sys.argv[1])
-    dtype = next(model.parameters()).dtype
+    load_model(model, checkpoint_file)
+    dtype = config.get_dtype()
     device = torch.device('cuda')
     # needed to fix rope
     model.type(dtype)
     model.to(device)
     tokenizer = SentencePieceProcessor()
-    tokenizer.Init(model_file='data/tokenizer7.model')
+    tokenizer.Init(model_file=config.tokenizer_model_path)
 
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)

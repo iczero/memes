@@ -88,7 +88,6 @@ class InputLayer(nn.Module):
         self.input_embedding = nn.Embedding(config.vocab_size, config.n_embed)
 
         self.make_qkv = nn.Sequential(
-            self.input_embedding,
             # qkv linear, (batch, seq, n_embed) -> (batch, seq, 3 * n_heads * n_embed)
             nn.Linear(
                 config.n_embed,
@@ -118,7 +117,8 @@ class InputLayer(nn.Module):
         # ensure sequence is of correct length
         assert x.shape[-1] == self.short_ctx_len
 
-        qkv_merged: torch.Tensor = self.make_qkv(x)
+        embeddings = self.input_embedding(x)
+        qkv_merged: torch.Tensor = self.make_qkv(embeddings)
         # extract q/k/v from merged
         # (batch, seq, n_heads, n_embed)
         # transpose to (batch, n_heads, seq, n_embed) for sdp

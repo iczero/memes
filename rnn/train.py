@@ -1,20 +1,23 @@
 import dataclasses
+import json
 import sys
 from collections.abc import Iterable
-from pathlib import Path
 
 import aim
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_model, save_model
 from sentencepiece import SentencePieceProcessor
 from torch import nn
 
-from .common import (ModelConfig, TrainConfig, load_dataset, random_token_not,
-                     tokenize_input)
+from .common import (
+    ModelConfig, TrainConfig, load_dataset, random_token_not, tokenize_input
+)
 from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
+"If torch.compile should be disabled"
+PONDER_ADJUST_LOOKBACK = 50
+"How many steps to look back to adjust ponder_loss_penalty"
 
 @torch.jit.script
 def ponder_loss(
@@ -39,12 +42,10 @@ class TrainSequence:
     "Unweighted cross entropy loss at the end of each halted step"
     prev_internal: torch.Tensor | None = None
     "Previous internal state, if not halted"
-    total_ponder: int = 0
-    "Total number of steps repeated for ponder at this offset"
     was_backspace: bool = False
     "If the last token was randomized for backspace"
 
-class Trainer:
+class TrainHelper:
     model_config: ModelConfig
     train_config: TrainConfig
     device: torch.device
@@ -57,15 +58,19 @@ class Trainer:
     "Previous batched internal state, if reusable"
     halted_sequences: list[int]
     "List of sequences by index which halted the last step"
+    prev_unweighted_losses: list[float]
+    "List of previous unweighted losses for adjusting ponder_loss_penalty"
+    aim_run: aim.Run | None = None
+    "Aim run instance for run tracking"
 
     def __init__(
         self,
         model_config: ModelConfig,
         train_config: TrainConfig,
         tokenizer: SentencePieceProcessor,
-        train_set: Path,
         device: torch.device,
         dtype: torch.dtype,
+        train_iter: Iterable[tuple[int, str]],
     ):
         self.model_config = model_config
         self.train_config = train_config
@@ -77,8 +82,7 @@ class Trainer:
         self.model.to(self.device)
         self.model.train()
 
-        self.train_file = open(train_set, 'rb')
-        self.train_iter = load_dataset(self.train_file)
+        self.train_iter = train_iter
 
     def next_sequence(self) -> list[int]:
         # TODO: what if this implodes
@@ -177,22 +181,17 @@ class Trainer:
             self.model_config.ponder_loss_penalty
         )
 
-        with torch.no_grad():
-            should_halt = p_halt_out.bernoulli()
-
         return next_recurrent, next_internal, token_out, p_halt_out, \
-            should_halt, cross_entropy, step_losses
+            cross_entropy, step_losses
 
     def forward_step(self):
         internal, expected_tokens = self.prepare_internal_batch()
 
-        next_recurrent, next_internal, _token_out, p_halt_out, should_halt, \
-            cross_entropy, step_losses = \
-            self.forward_ponder_batch(self.recurrent, internal, expected_tokens)
+        next_recurrent, next_internal, _token_out, p_halt_out, cross_entropy, \
+            step_losses = self.forward_ponder_batch(self.recurrent, internal, expected_tokens)
 
-        # print('forward_step(): p_halt', p_halt_out)
+        print('forward_step(): p_halt', p_halt_out)
 
-        should_halt = should_halt.nonzero().flatten().tolist()
         self.recurrent = next_recurrent
         self.halted_sequences.clear()
         ended_count = 0
@@ -202,12 +201,11 @@ class Trainer:
                 ended_count += 1
                 continue
 
-            p_halt_detached = p_halt_out[i].clone().detach()
-            did_halt = i in should_halt
-            if not did_halt and info.total_ponder >= self.train_config.max_ponder_steps:
-                # force halt
-                p_halt_detached.copy_(1.)
-                did_halt = True
+            p_halt_detached: torch.Tensor = torch.max(
+                p_halt_out[i].to('cpu').clone().detach(),
+                self.train_config.min_p_halt
+            )
+            did_halt = p_halt_detached.bernoulli() > 0
 
             # P(halt | not previously halted) * ponder step loss
             weighted_loss = info.p_not_halt * p_halt_detached * step_losses[i]
@@ -215,7 +213,6 @@ class Trainer:
 
             if did_halt:
                 info.prev_internal = None
-                info.total_ponder = 0
                 info.p_not_halt.copy_(1.)
                 # record unweighted loss as well
                 info.halted_losses.append(cross_entropy[i])
@@ -239,7 +236,6 @@ class Trainer:
             else:
                 info.prev_internal = next_internal[i]
                 info.p_not_halt *= 1 - p_halt_detached
-                info.total_ponder += 1
 
         return ended_count
 
@@ -263,7 +259,7 @@ class Trainer:
 
         return torch.stack(sequence_losses).sum() / len(sequence_losses)
 
-    def sum_validation_loss(self) -> torch.Tensor:
+    def sum_unweighted_loss(self) -> torch.Tensor:
         sequence_losses = []
         for info in self.sequences:
             if len(info.halted_losses) == 0:
@@ -274,39 +270,123 @@ class Trainer:
 
         return torch.stack(sequence_losses).sum() / len(sequence_losses)
 
+    def backward_all(self):
+        train_loss = self.sum_train_loss()
+        unweighted_loss_f = self.sum_unweighted_loss().item()
+        train_loss_f = train_loss.item()
+        train_loss.backward()
+
+        grads_norm_f = nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.train_config.clip_grad_norm,
+            error_if_nonfinite=True,
+        ).item()
+
+        self.prev_unweighted_losses.append(unweighted_loss_f)
+        if len(self.prev_unweighted_losses) > PONDER_ADJUST_LOOKBACK:
+            self.prev_unweighted_losses.pop(0)
+
+        return train_loss_f, unweighted_loss_f, grads_norm_f
+
+    def adjust_ponder_params(self):
+        sorted_losses = sorted(self.prev_unweighted_losses)
+        median_index = (len(sorted_losses) - 1) * self.train_config.ponder_target_loss
+        target_loss = sorted_losses[round(median_index)]
+        print('adjust_ponder_params(): selecting target loss', target_loss)
+        self.model_config.ponder_loss_penalty = \
+            (self.model_config.ponder_continue_penalty + target_loss) / target_loss
+
+        return self.model_config.ponder_loss_penalty
+
+    def track(
+        self,
+        value,
+        name: str = None,
+        step: int = None,
+        epoch: int = None,
+        *,
+        context: dict = None
+    ) -> None:
+        "Track stat with aim"
+        if self.aim_run is not None:
+            self.aim_run.track(value, name, step, epoch, context=context)
+
 def main():
-    in_path = Path(sys.argv[1])
-    #validation_set = in_path / 'val.jsonl.zst'
-    train_set = in_path / 'train' / '02.jsonl.zst'
     device = torch.device('cuda')
-    dtype = torch.float32
 
-    #torch.autograd.set_detect_anomaly(True)
-    torch.set_float32_matmul_precision('high')
+    subcommand = sys.argv[1]
+    # optimizer state to load, if any
+    load_optimizer_state = None
+    if subcommand == 'new':
+        config_path = sys.argv[2]
+        checkpoint_path = sys.argv[3]
+        data_path = sys.argv[4]
+        with open(config_path, 'rb') as f:
+            init_config = json.load(f)
 
-    model_config = ModelConfig.default()
-    train_config = TrainConfig.default()
-    tokenizer = SentencePieceProcessor()
-    tokenizer.Init(model_file='data/tokenizer7.model')
+        model_config = ModelConfig.from_dict(init_config['model_config'])
+        train_config = TrainConfig.from_dict(init_config['train_config'])
+        tokenizer = SentencePieceProcessor()
+        tokenizer.Init(model_file=model_config.tokenizer_model_path)
 
-    trainer = Trainer(model_config, train_config, tokenizer, train_set, device, dtype)
+        dtype = model_config.get_dtype()
+        trainer = TrainHelper(
+            model_config,
+            train_config,
+            tokenizer,
+            device,
+            dtype,
+            train_iter=None, # placeholder
+        )
+        trainer.aim_run = aim.Run()
 
+    elif subcommand == 'load':
+        checkpoint_path = sys.argv[2]
+        data_path = sys.argv[3]
+
+        loaded = torch.load(checkpoint_path)
+        model_config = ModelConfig.from_dict(loaded['model_config'])
+        train_config = TrainConfig.from_dict(loaded['train_config'])
+        tokenizer = SentencePieceProcessor()
+        tokenizer.Init(model_file=model_config.tokenizer_model_path)
+        trainer = TrainHelper(
+            model_config,
+            train_config,
+            tokenizer,
+            device,
+            model_config.get_dtype(),
+            train_iter=None,
+        )
+        print('loading model')
+        trainer.model.load_state_dict(loaded['model_state'])
+
+        if 'run_hash' in loaded:
+            trainer.aim_run = aim.Run(run_hash=loaded['run_hash'])
+
+        if 'optimizer_state' in loaded:
+            load_optimizer_state = loaded['optimizer_state']
+
+    data_file = open(data_path, 'rb')
+    train_iter = load_dataset(data_file)
+    trainer.train_iter = train_iter
     model = trainer.model
-    try:
-        # TODO: save hyperparameters and training progress to the checkpoint
-        load_model(model, 'rnn-load.model')
-    except FileNotFoundError:
-        print('warning: could not find file to load')
+    optimizer = train_config.make_optimizer(model.parameters())
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        train_config.lr,
-        weight_decay=train_config.weight_decay
-    )
+    if load_optimizer_state is not None:
+        print('loading optimizer state')
+        optimizer.load_state_dict(load_optimizer_state)
 
-    run = aim.Run()
-    run['model_config'] = dataclasses.asdict(model_config)
-    run['train_config'] = dataclasses.asdict(train_config)
+    def save_checkpoint(save_to: str):
+        state = {
+            'model_config': model_config.to_dict(),
+            'train_config': train_config.to_dict(),
+            'model_state': model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+        }
+        if trainer.aim_run is not None:
+            state['run_hash'] = trainer.aim_run.hash
+
+        torch.save(state, save_to)
 
     batch = 0
     step = 0
@@ -321,39 +401,30 @@ def main():
             trainer.next_batch()
 
         backprop_steps = 0
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            while backprop_steps < train_config.truncate_steps:
-                done_count = trainer.forward_step()
-                backprop_steps += 1
+        while backprop_steps < train_config.truncate_steps:
+            done_count = trainer.forward_step()
+            backprop_steps += 1
 
-            loss = trainer.sum_train_loss()
-            show_loss = loss.item()
-            show_unweighted_loss = trainer.sum_validation_loss().item()
-            loss.backward()
+        train_loss_f, unweighted_loss_f, grads_norm_f = trainer.backward_all()
 
-        try:
-            show_grads_norm = nn.utils.clip_grad_norm_(
-                model.parameters(), 3., error_if_nonfinite=True
-            ).item()
-        except RuntimeError as e:
-            print('\nwarning: clip_grad_norm_ failed:', e)
-            print('  the current step will be skipped')
-            print('batch:', step)
-            print('loss:', show_loss)
-            continue
+        print('\nstep:', step, 'batch:', batch)
+        print('grad norm:', grads_norm_f)
+        print('training loss:', train_loss_f)
+        print('unweighted loss:', unweighted_loss_f)
+        trainer.track(train_loss_f, name='loss', step=step)
+        trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
+        trainer.track(grads_norm_f, name='grad_norm', step=step)
 
         optimizer.step()
-        print('\nstep:', step, 'batch:', batch)
-        print('grad norm:', show_grads_norm)
-        print('training loss:', show_loss)
-        print('unweighted loss:', show_unweighted_loss)
-        run.track(show_loss, name='loss', step=step)
-        run.track(show_grads_norm, name='grad_norm', step=step)
-
         trainer.truncate_backprop()
 
-        if step % 500 == 0:
-            save_model(model, 'rnn-test.model')
+        if step % 25 and step > PONDER_ADJUST_LOOKBACK:
+            ponder_loss_penalty = trainer.adjust_ponder_params()
+            print('adjusted ponder loss penalty', ponder_loss_penalty)
+            trainer.track(ponder_loss_penalty, name='ponder_loss_penalty', step=step)
+
+        if step % 500:
+            save_checkpoint(checkpoint_path)
 
 if __name__ == '__main__':
     main()

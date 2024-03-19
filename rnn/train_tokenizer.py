@@ -50,7 +50,7 @@ def main():
         sentence_iterator=generate_sentences(),
         model_type='unigram',
         model_prefix=out_prefix,
-        vocab_size=16000,
+        vocab_size=8192,
         max_sentence_length=16384,
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,
