@@ -6,6 +6,7 @@ from collections.abc import Iterable
 import aim
 import torch
 import torch.nn.functional as F
+import torch._dynamo.config
 from sentencepiece import SentencePieceProcessor
 from torch import nn
 
@@ -16,8 +17,11 @@ from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
-PONDER_ADJUST_LOOKBACK = 50
+PONDER_ADJUST_LOOKBACK = 1024
 "How many steps to look back to adjust ponder_loss_penalty"
+
+# input layer may trigger recompiles up to batch_size
+#torch._dynamo.config.cache_size_limit = 64
 
 @torch.jit.script
 def ponder_loss(
@@ -50,7 +54,7 @@ class TrainHelper:
     train_config: TrainConfig
     device: torch.device
     dtype: torch.dtype
-    sequences: list[TrainSequence] = []
+    sequences: list[TrainSequence]
     model: RNNSequence
     recurrent: torch.Tensor
     tokenizer: SentencePieceProcessor
@@ -77,6 +81,7 @@ class TrainHelper:
         self.device = device
         self.dtype = dtype
         self.tokenizer = tokenizer
+        self.prev_unweighted_losses = []
         self.model = RNNSequence(model_config)
         self.model.type(self.dtype)
         self.model.to(self.device)
@@ -101,7 +106,7 @@ class TrainHelper:
         ]
         self.halted_sequences = list(range(batch_size))
 
-    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
     def forward_input_batch(self, input_encode: torch.Tensor):
         return self.model.input(input_encode)
 
@@ -168,7 +173,8 @@ class TrainHelper:
         self,
         recurrent: torch.Tensor,
         internal: torch.Tensor,
-        expected_tokens: torch.Tensor
+        expected_tokens: torch.Tensor,
+        ponder_loss_penalty: torch.Tensor,
     ):
         next_recurrent, next_internal = self.model.ponder(recurrent, internal)
         token_out, p_halt_out = self.model.decode(next_recurrent, next_internal)
@@ -178,7 +184,7 @@ class TrainHelper:
             cross_entropy,
             p_halt_out,
             self.model_config.ponder_continue_penalty,
-            self.model_config.ponder_loss_penalty
+            ponder_loss_penalty,
         )
 
         return next_recurrent, next_internal, token_out, p_halt_out, \
@@ -187,10 +193,19 @@ class TrainHelper:
     def forward_step(self):
         internal, expected_tokens = self.prepare_internal_batch()
 
-        next_recurrent, next_internal, _token_out, p_halt_out, cross_entropy, \
-            step_losses = self.forward_ponder_batch(self.recurrent, internal, expected_tokens)
+        next_recurrent, next_internal, _token_out, p_halt_out, cross_entropy, step_losses = \
+            self.forward_ponder_batch(
+                self.recurrent,
+                internal,
+                expected_tokens,
+                torch.tensor( # prevent torch.compile from recompiling on chnage
+                    self.model_config.ponder_loss_penalty,
+                    device=self.device,
+                    dtype=self.dtype
+                ),
+            )
 
-        print('forward_step(): p_halt', p_halt_out)
+        # print('forward_step(): p_halt', p_halt_out)
 
         self.recurrent = next_recurrent
         self.halted_sequences.clear()
@@ -203,7 +218,7 @@ class TrainHelper:
 
             p_halt_detached: torch.Tensor = torch.max(
                 p_halt_out[i].to('cpu').clone().detach(),
-                self.train_config.min_p_halt
+                torch.tensor(self.train_config.min_p_halt, device='cpu'),
             )
             did_halt = p_halt_detached.bernoulli() > 0
 
@@ -365,6 +380,9 @@ def main():
 
         if 'optimizer_state' in loaded:
             load_optimizer_state = loaded['optimizer_state']
+    else:
+        print('unknown subcommand:', subcommand)
+        return
 
     data_file = open(data_path, 'rb')
     train_iter = load_dataset(data_file)
@@ -411,20 +429,21 @@ def main():
         print('grad norm:', grads_norm_f)
         print('training loss:', train_loss_f)
         print('unweighted loss:', unweighted_loss_f)
-        trainer.track(train_loss_f, name='loss', step=step)
+        trainer.track(train_loss_f, name='train_loss', step=step)
         trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
         trainer.track(grads_norm_f, name='grad_norm', step=step)
 
         optimizer.step()
         trainer.truncate_backprop()
 
-        if step % 25 and step > PONDER_ADJUST_LOOKBACK:
+        if step % 25 == 0 and step > PONDER_ADJUST_LOOKBACK:
             ponder_loss_penalty = trainer.adjust_ponder_params()
             print('adjusted ponder loss penalty', ponder_loss_penalty)
             trainer.track(ponder_loss_penalty, name='ponder_loss_penalty', step=step)
 
-        if step % 500:
+        if step % 500 == 0:
             save_checkpoint(checkpoint_path)
+            print('checkpoint saved to', checkpoint_path)
 
 if __name__ == '__main__':
     main()
