@@ -18,18 +18,23 @@ from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
-PONDER_ADJUST_LOOKBACK = 1024
+PONDER_ADJUST_LOOKBACK = 2048
 "How many steps to look back to adjust ponder_loss_penalty"
 
-# input layer may trigger recompiles up to batch_size
-#torch._dynamo.config.cache_size_limit = 64
-
 @torch.jit.script
-def ponder_loss(
-    loss: torch.Tensor, p_halt: torch.Tensor,
-    continue_penalty: float, loss_penalty: float
+def confidence_loss(
+    loss: torch.Tensor, confidence_logit: torch.Tensor,
+    prev_mean: torch.Tensor, prev_std: torch.Tensor,
 ):
-    return continue_penalty * (1 - p_halt) + loss * loss_penalty ** p_halt
+    SQRT_2 = torch.sqrt(torch.tensor(2.))
+    # rescale loss to standard normal
+    loss_normal = (loss - prev_mean) / prev_std
+    target_confidence = F.sigmoid(loss_normal * SQRT_2)
+    return F.binary_cross_entropy_with_logits(
+        confidence_logit,
+        target_confidence,
+        reduction='none'
+    )
 
 @dataclasses.dataclass
 class TrainSequence:
@@ -175,38 +180,43 @@ class TrainHelper:
         recurrent: torch.Tensor,
         internal: torch.Tensor,
         expected_tokens: torch.Tensor,
-        ponder_loss_penalty: torch.Tensor,
+        prev_loss_mean: torch.Tensor,
+        prev_loss_std: torch.Tensor,
     ):
         next_recurrent, next_internal = self.model.ponder(recurrent, internal)
-        token_out, p_halt_out = self.model.decode(next_recurrent, next_internal)
+        token_out, confidence_out = self.model.decode(next_recurrent, next_internal)
 
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
-        step_losses = ponder_loss(
-            cross_entropy,
-            p_halt_out,
-            self.model_config.ponder_continue_penalty,
-            ponder_loss_penalty,
-        )
+        step_losses = cross_entropy + self.train_config.confidence_scale * \
+            confidence_loss(cross_entropy, confidence_out, prev_loss_mean, prev_loss_std)
+        p_halt_out = F.sigmoid(confidence_out + self.model_config.ponder_adjust)
 
-        return next_recurrent, next_internal, token_out, p_halt_out, \
-            cross_entropy, step_losses
+        return next_recurrent, next_internal, token_out, confidence_out, \
+            p_halt_out, cross_entropy, step_losses
 
     def forward_step(self):
         internal, expected_tokens = self.prepare_internal_batch()
 
-        next_recurrent, next_internal, _token_out, p_halt_out, cross_entropy, step_losses = \
+        next_recurrent, next_internal, _token_out, _confidence_out, p_halt_out, \
+            cross_entropy, step_losses = \
             self.forward_ponder_batch(
                 self.recurrent,
                 internal,
                 expected_tokens,
-                torch.tensor( # prevent torch.compile from recompiling on chnage
-                    self.model_config.ponder_loss_penalty,
+                prev_loss_mean=torch.tensor( # prevent torch.compile from recompiling on change
+                    self.train_config.prev_loss_mean,
+                    device=self.device,
+                    dtype=self.dtype
+                ),
+                prev_loss_std=torch.tensor(
+                    self.train_config.prev_loss_std,
                     device=self.device,
                     dtype=self.dtype
                 ),
             )
 
-        # print('forward_step(): p_halt', p_halt_out)
+        print('forward_step(): p_halt', p_halt_out)
+        print('forward_step(): confidence', _confidence_out)
 
         self.recurrent = next_recurrent
         self.halted_sequences.clear()
@@ -304,15 +314,15 @@ class TrainHelper:
 
         return train_loss_f, unweighted_loss_f, grads_norm_f
 
-    def adjust_ponder_params(self):
-        mean = np.mean(self.prev_unweighted_losses)
-        stdev = np.std(self.prev_unweighted_losses)
-        target_loss = mean + stdev * self.train_config.ponder_target_loss
-        print('adjust_ponder_params(): selecting target loss', target_loss)
-        self.model_config.ponder_loss_penalty = \
-            (self.model_config.ponder_continue_penalty + target_loss) / target_loss
-
-        return self.model_config.ponder_loss_penalty
+    def adjust_confidence_stats(self):
+        self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses)
+        self.train_config.prev_loss_std = np.std(self.prev_unweighted_losses)
+        print(
+            'adjust_confidence_stats: mean',
+            self.train_config.prev_loss_mean,
+            'std',
+            self.train_config.prev_loss_std,
+        )
 
     def track(
         self,
@@ -443,13 +453,15 @@ def main():
         trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
         trainer.track(grads_norm_f, name='grad_norm', step=step)
 
+        if grads_norm_f > 1e6:
+            print('\n\nerror: norm of gradients is too high, aborting:', grads_norm_f)
+            raise RuntimeError(f'grads_norm too high: {grads_norm_f}')
+
         optimizer.step()
         trainer.truncate_backprop()
 
         if step % 25 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
-            ponder_loss_penalty = trainer.adjust_ponder_params()
-            print('adjusted ponder loss penalty', ponder_loss_penalty)
-            trainer.track(ponder_loss_penalty, name='ponder_loss_penalty', step=step)
+            trainer.adjust_confidence_stats()
 
         if step % 500 == 0:
             save_checkpoint(checkpoint_path)

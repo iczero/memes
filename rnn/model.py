@@ -198,7 +198,7 @@ class RNNPonder(nn.Module):
         return out, internal
 
 class OutputDecode(nn.Module):
-    "Derive output token and ponder p_halt from recurrent state"
+    "Derive output token and ponder confidence from recurrent state"
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.n_embed = config.n_embed
@@ -229,7 +229,7 @@ class OutputDecode(nn.Module):
         self.ff_halt = nn.Sequential(
             nn.Linear(config.n_embed, config.n_embed),
             config.get_activation(),
-            nn.Linear(config.n_embed, 1), # p_halt
+            nn.Linear(config.n_embed, 1), # confidence
         )
 
     def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
@@ -259,10 +259,10 @@ class OutputDecode(nn.Module):
         # (batch, out/halt, "seq", n_embed) -> (batch, n_embed)
         token_out = self.ff_out(attn_out[..., 0, 0, :])
         # -> (batch, 1)
-        p_halt_out = self.ff_halt(attn_out[..., 1, 0, :])
+        confidence_out = self.ff_halt(attn_out[..., 1, 0, :])
 
         # out: (batch, vocab_size), (batch)
-        return token_out, F.sigmoid(p_halt_out.squeeze(-1))
+        return token_out, confidence_out.squeeze(-1)
 
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
