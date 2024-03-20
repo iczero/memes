@@ -27,8 +27,9 @@ def confidence_loss(
     prev_mean: torch.Tensor, prev_std: torch.Tensor,
 ):
     SQRT_2 = torch.sqrt(torch.tensor(2.))
-    # rescale loss to standard normal
-    loss_normal = (loss - prev_mean) / prev_std
+    # rescale loss to standard normal, negate for high loss -> low confidence
+    loss_normal = -(loss - prev_mean) / prev_std
+    # needs sqrt(2) due to normal/logistic regression cdf difference wrt. sigmoid/tanh
     target_confidence = F.sigmoid(loss_normal * SQRT_2)
     return F.binary_cross_entropy_with_logits(
         confidence_logit,
