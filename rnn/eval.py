@@ -1,6 +1,7 @@
 import sys
 
 import torch
+import torch.nn.functional as F
 from sentencepiece import SentencePieceProcessor
 
 from .model import ModelConfig, RNNSequence
@@ -67,7 +68,8 @@ class InferenceHelper:
         ponder_count = 0
         while not halt:
             self.recurrent, internal = self.model.ponder(self.recurrent, internal)
-            token_logits, p_halt = self.model.decode(self.recurrent, internal)
+            token_logits, confidence_logit = self.model.decode(self.recurrent, internal)
+            p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
             halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count > max_ponder
             if halt:
                 return token_logits

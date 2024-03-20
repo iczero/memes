@@ -188,18 +188,18 @@ class TrainHelper:
         token_out, confidence_out = self.model.decode(next_recurrent, next_internal)
 
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
-        step_losses = cross_entropy + self.train_config.confidence_scale * \
+        confidence_losses = self.train_config.confidence_scale * \
             confidence_loss(cross_entropy, confidence_out, prev_loss_mean, prev_loss_std)
         p_halt_out = F.sigmoid(confidence_out + self.model_config.ponder_adjust)
 
         return next_recurrent, next_internal, token_out, confidence_out, \
-            p_halt_out, cross_entropy, step_losses
+            p_halt_out, cross_entropy, confidence_losses
 
     def forward_step(self):
         internal, expected_tokens = self.prepare_internal_batch()
 
         next_recurrent, next_internal, _token_out, _confidence_out, p_halt_out, \
-            cross_entropy, step_losses = \
+            cross_entropy, confidence_losses = \
             self.forward_ponder_batch(
                 self.recurrent,
                 internal,
@@ -216,8 +216,8 @@ class TrainHelper:
                 ),
             )
 
-        print('forward_step(): p_halt', p_halt_out)
-        print('forward_step(): confidence', _confidence_out)
+        #print('forward_step(): p_halt', p_halt_out)
+        #print('forward_step(): confidence', _confidence_out)
 
         self.recurrent = next_recurrent
         self.halted_sequences.clear()
@@ -235,7 +235,7 @@ class TrainHelper:
             did_halt = p_halt_detached.bernoulli() > 0
 
             # P(halt | not previously halted) * ponder step loss
-            weighted_loss = info.p_not_halt * p_halt_detached * step_losses[i]
+            weighted_loss = info.p_not_halt * p_halt_detached * cross_entropy[i] + confidence_losses[i]
             info.losses.append(weighted_loss)
 
             if did_halt:
