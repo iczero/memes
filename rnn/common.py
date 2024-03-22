@@ -21,6 +21,7 @@ class ModelConfig:
     short_ctx_len: int
     "Length of input short context sequence"
     internal_seq_len: int
+    # TODO: "internal_seq_len" is a terrible name and is literally not even consistent
     "Length of internal sequence (total, short_ctx + recurrent)"
     recurrent_seq_len: int = dataclasses.field(init=False)
     "Length of recurrent sequence"
