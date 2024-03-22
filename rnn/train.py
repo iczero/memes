@@ -1,4 +1,5 @@
 import dataclasses
+import datetime
 import json
 import sys
 from collections.abc import Iterable
@@ -51,6 +52,8 @@ class TrainSequence:
     "List of losses for all steps"
     halted_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
     "Unweighted cross entropy loss at the end of each halted step"
+    confidence_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    "History of confidence losses, for metrics"
     prev_internal: torch.Tensor | None = None
     "Previous internal state, if not halted"
     was_backspace: bool = False
@@ -237,6 +240,7 @@ class TrainHelper:
             # P(halt | not previously halted) * ponder step loss
             weighted_loss = info.p_not_halt * p_halt_detached * cross_entropy[i] + confidence_losses[i]
             info.losses.append(weighted_loss)
+            info.confidence_losses.append(confidence_losses[i].clone().detach().to('cpu'))
 
             if did_halt:
                 info.prev_internal = None
@@ -272,6 +276,7 @@ class TrainHelper:
         for info in self.sequences:
             info.losses.clear()
             info.halted_losses.clear()
+            info.confidence_losses.clear()
             if info.prev_internal is not None:
                 info.prev_internal = info.prev_internal.detach()
 
@@ -290,7 +295,6 @@ class TrainHelper:
         sequence_losses = []
         for info in self.sequences:
             if len(info.halted_losses) == 0:
-                assert info.ended
                 continue
 
             seq_mean = torch.stack(info.halted_losses).sum() / len(info.halted_losses)
@@ -300,6 +304,20 @@ class TrainHelper:
                 self.prev_unweighted_losses = self.prev_unweighted_losses[PONDER_ADJUST_LOOKBACK:]
 
         return torch.stack(sequence_losses).sum() / len(sequence_losses)
+
+    def sum_confidence_losses(self) -> torch.Tensor:
+        # TODO: this function ought to just return a histogram or something
+        sequence_losses = []
+        for info in self.sequences:
+            if len(info.confidence_losses) == 0:
+                continue
+
+            sequence_losses.append(
+                torch.stack(info.confidence_losses).sum() / len(info.confidence_losses)
+            )
+
+        return torch.stack(sequence_losses).sum() / len(sequence_losses) \
+            / self.train_config.confidence_scale
 
     def backward_all(self):
         train_loss = self.sum_train_loss()
@@ -340,6 +358,7 @@ class TrainHelper:
 
 def main():
     device = torch.device('cuda')
+    torch.set_float32_matmul_precision('high')
 
     subcommand = sys.argv[1]
     # optimizer state to load, if any
@@ -393,6 +412,10 @@ def main():
 
         if 'run_hash' in loaded:
             trainer.aim_run = aim.Run(run_hash=loaded['run_hash'])
+        else:
+            trainer.aim_run = aim.Run()
+            trainer.aim_run['model_config'] = model_config.to_dict()
+            trainer.aim_run['train_config'] = train_config.to_dict()
 
         if 'optimizer_state' in loaded:
             load_optimizer_state = loaded['optimizer_state']
@@ -453,6 +476,8 @@ def main():
         trainer.track(train_loss_f, name='train_loss', step=step)
         trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
         trainer.track(grads_norm_f, name='grad_norm', step=step)
+        confidence_loss_f = trainer.sum_confidence_losses().item()
+        trainer.track(confidence_loss_f, name='confidence_loss', step=step)
 
         if grads_norm_f > 1e6:
             print('\n\nerror: norm of gradients is too high, aborting:', grads_norm_f)
@@ -463,10 +488,13 @@ def main():
 
         if step % 25 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
             trainer.adjust_confidence_stats()
+            trainer.track(trainer.train_config.prev_loss_mean, name='prev_loss_mean', step=step)
+            trainer.track(trainer.train_config.prev_loss_std, name='prev_loss_std', step=step)
 
-        if step % 500 == 0:
-            save_checkpoint(checkpoint_path)
-            print('checkpoint saved to', checkpoint_path)
+        if step % 1000 == 0:
+            save_path = checkpoint_path + '.' + str(int(datetime.datetime.now().timestamp()))
+            save_checkpoint(save_path)
+            print('checkpoint saved to', save_path)
 
 if __name__ == '__main__':
     main()

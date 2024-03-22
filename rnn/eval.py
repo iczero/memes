@@ -70,7 +70,7 @@ class InferenceHelper:
             self.recurrent, internal = self.model.ponder(self.recurrent, internal)
             token_logits, confidence_logit = self.model.decode(self.recurrent, internal)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
-            halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count > max_ponder
+            halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
             if halt:
                 return token_logits
 
@@ -103,12 +103,12 @@ class InferenceHelper:
 def main():
     # TODO: save this to serialized model or something
     checkpoint_file = sys.argv[1]
-    loaded = torch.load(checkpoint_file)
+    device = torch.device('cpu')
+    loaded = torch.load(checkpoint_file, map_location=device)
     config = ModelConfig.from_dict(loaded['model_config'])
     model = RNNSequence(config)
     model.load_state_dict(loaded['model_state'])
     dtype = config.get_dtype()
-    device = torch.device('cuda')
     # needed to fix rope
     model.type(dtype)
     model.to(device)
@@ -127,7 +127,7 @@ def main():
 
         print('\n\ngenerated:')
 
-        for token in infer.generate_tokens():
+        for token in infer.generate_tokens(max_ponder=16):
             print(tokenizer.IdToPiece(token), end='', flush=True)
 
         print('\n\n================')
