@@ -21,7 +21,7 @@ class ModelConfig:
     short_ctx_len: int
     "Length of input short context sequence"
     internal_seq_len: int
-    "Length of internal sequence"
+    "Length of internal sequence (total, short_ctx + recurrent)"
     recurrent_seq_len: int = dataclasses.field(init=False)
     "Length of recurrent sequence"
     ff_dropout_p: float
@@ -102,6 +102,8 @@ class TrainConfig:
     "Batch size"
     truncate_steps: int
     "Max steps to run training (temporary)"
+    accumulate_gradients: int
+    "How many batches to run before running the optimizer step"
     clip_grad_norm: float
     "Norm for gradient clipping"
     optimizer: str
@@ -129,6 +131,7 @@ class TrainConfig:
             confidence_scale=float(obj['confidence_scale']),
             prev_loss_mean=float(obj['prev_loss_mean']),
             prev_loss_std=float(obj['prev_loss_std']),
+            accumulate_gradients=int(obj['accumulate_gradients']),
         )
 
     def to_dict(self):

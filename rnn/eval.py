@@ -67,8 +67,8 @@ class InferenceHelper:
         halt = False
         ponder_count = 0
         while not halt:
-            self.recurrent, internal = self.model.ponder(self.recurrent, internal)
-            token_logits, confidence_logit = self.model.decode(self.recurrent, internal)
+            self.recurrent, internal, token_logits, confidence_logit = \
+                self.model.ponder(self.recurrent, internal)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
             halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
             if halt:

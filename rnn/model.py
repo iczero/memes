@@ -6,44 +6,46 @@ from .common import ModelConfig
 from .rotary_encoding import RotaryEncoding
 
 
-class PartialCrossAttention(nn.Module):
-    "Partial cross attention layer"
+class SelfAttention(nn.Module):
+    "Self attention layer"
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, is_input_layer=False):
         super().__init__()
         self.n_attention_heads = config.n_attention_heads
         self.n_embed = config.n_embed
-        self.attn_dropout_p = config.attn_dropout_p
-        # in: external: (batch, seq, n_embed), internal: (batch, seq, n_embed)
-        # split these two since q and k/v have different inputs
-        self.q_linear = nn.Linear(
+        # in: (batch, seq, n_embed)
+        self.qkv_linear = nn.Linear(
             config.n_embed,
-            config.n_attention_heads * config.n_embed,
-            bias=config.qkv_bias,
-        )
-        self.kv_linear = nn.Linear(
-            config.n_embed,
-            2 * config.n_attention_heads * config.n_embed,
+            3 * config.n_attention_heads * config.n_embed,
             bias=config.qkv_bias,
         )
 
-    def forward(self, external: torch.Tensor, internal: torch.Tensor):
-        # external is the other sequence concatenated to k/v, internal is our own sequence
-        # q shape: (batch, seq, n_heads, n_embed)
-        # transpose (batch, seq, n_heads, n_embed) -> (batch, n_heads, seq, n_embed) for sdp
-        q = self.q_linear(internal) \
-            .unflatten(-1, (self.n_attention_heads, self.n_embed)) \
-            .transpose(-2, -3)
-        kv_seq = torch.concat((external, internal), dim=-2)
-        # kv_merged shape: (batch, seq, 2, n_heads, n_embed)
-        kv_merged = self.kv_linear(kv_seq).unflatten(-1, (2, self.n_attention_heads, self.n_embed))
+        if is_input_layer:
+            # use rotary positional encoding
+            self.rope = RotaryEncoding(config.n_embed, config.short_ctx_len)
+            # do not use dropout in input layer (does this make a difference?)
+            self.attn_dropout = 0
+        else:
+            self.rope = None
+            self.attn_dropout = config.attn_dropout_p
+
+    def forward(self, sequence: torch.Tensor):
+        # kv_merged shape: (batch, seq, 3 (q/k/v), n_heads, n_embed)
+        kv_merged = self.qkv_linear(sequence) \
+            .unflatten(-1, (3, self.n_attention_heads, self.n_embed))
         # extract from merged
-        k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        q = kv_merged[..., 0, :, :].transpose(-2, -3)
+        k = kv_merged[..., 1, :, :].transpose(-2, -3)
+        v = kv_merged[..., 2, :, :].transpose(-2, -3)
+
+        if self.rope is not None:
+            # apply positional encodings
+            q = self.rope(q)
+            k = self.rope(k)
 
         # why does pylint think this isn't callable?
         # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
 
         # transpose back
         return attn_out.transpose(-2, -3)
@@ -86,20 +88,7 @@ class InputLayer(nn.Module):
         self.short_ctx_len = config.short_ctx_len
         # in: (batch, seq)
         self.input_embedding = nn.Embedding(config.vocab_size, config.n_embed)
-
-        self.make_qkv = nn.Sequential(
-            # qkv linear, (batch, seq, n_embed) -> (batch, seq, 3 * n_heads * n_embed)
-            nn.Linear(
-                config.n_embed,
-                3 * config.n_attention_heads * config.n_embed,
-                bias=config.qkv_bias,
-            ),
-            # (batch, seq, n_embed) -> (batch, seq, 3, n_heads, n_embed)
-            nn.Unflatten(-1, (3, config.n_attention_heads, config.n_embed))
-        )
-
-        # positional encoding
-        self.rope = RotaryEncoding(config.n_embed, config.short_ctx_len)
+        self.attention = SelfAttention(config, is_input_layer=True)
 
         # no residuals in input layer
         # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
@@ -118,24 +107,10 @@ class InputLayer(nn.Module):
         assert x.shape[-1] == self.short_ctx_len
 
         embeddings = self.input_embedding(x)
-        qkv_merged: torch.Tensor = self.make_qkv(embeddings)
-        # extract q/k/v from merged
-        # (batch, seq, n_heads, n_embed)
-        # transpose to (batch, n_heads, seq, n_embed) for sdp
-        q = qkv_merged[..., 0, :, :].transpose(-2, -3)
-        k = qkv_merged[..., 1, :, :].transpose(-2, -3)
-        v = qkv_merged[..., 2, :, :].transpose(-2, -3)
+        attn_out = self.attention(embeddings)
 
-        # apply rotary positional embedding on q/k
-        q = self.rope(q)
-        k = self.rope(k)
-
-        # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
-
-        # transpose back (batch, seq, n_heads, n_embed), then ff
         # out shape is (batch, seq, n_embed)
-        return self.feedforward(attn_out.transpose(-2, -3))
+        return self.feedforward(attn_out)
 
 class IntermediateLayer(nn.Module):
     "The intermediate layers(s) of the model"
@@ -143,59 +118,15 @@ class IntermediateLayer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.norm = nn.LayerNorm((config.n_embed,))
-        self.attention = PartialCrossAttention(config)
+        self.attention = SelfAttention(config)
         self.feedforward = GatedFeedForward(config)
 
-    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
-        bypass = internal
-        internal = self.norm(internal)
-        internal = self.attention(recurrent, internal)
-        internal = self.feedforward(internal)
-        return bypass + internal
-
-class OutputLayer(nn.Module):
-    "The output layer of the model"
-
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.norm = nn.LayerNorm((config.n_embed,))
-        self.attention = PartialCrossAttention(config)
-        self.feedforward = GatedFeedForward(config)
-
-    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
-        # normalize internal from previous intermediate layer
-        internal = self.norm(internal)
-        # we are computing residual to recurrent state, so "recurrent" is "internal"
-        out = self.attention(internal, recurrent)
-        out = self.feedforward(out)
-        return out
-
-class RNNPonder(nn.Module):
-    """
-    The part of the model rerun for ponder
-
-    Contains intermediate layers followed by an output layer. Does not contain
-    the input layer, which should be run before.
-    """
-
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.norm = nn.LayerNorm((config.n_embed,))
-        self.intermediate = nn.ModuleList(
-            IntermediateLayer(config) for _ in range(config.n_intermediate))
-        self.output = OutputLayer(config)
-
-    # recurrent is recurrent state, internal is output of input layer, or if
-    # pondering, the internal output of the previous RNNPonder step
-    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
-        bypass = recurrent
-        recurrent = self.norm(recurrent)
-        for layer in self.intermediate:
-            internal = layer(recurrent, internal)
-
-        resid = self.output(recurrent, internal)
-        out = bypass + resid
-        return out, internal
+    def forward(self, sequence: torch.Tensor):
+        bypass = sequence
+        sequence = self.norm(sequence)
+        sequence = self.attention(sequence)
+        sequence = self.feedforward(sequence)
+        return bypass + sequence
 
 class OutputDecode(nn.Module):
     "Derive output token and ponder confidence from recurrent state"
@@ -226,21 +157,22 @@ class OutputDecode(nn.Module):
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
-        self.ff_halt = nn.Sequential(
+        self.ff_confidence = nn.Sequential(
             nn.Linear(config.n_embed, config.n_embed),
             config.get_activation(),
             nn.Linear(config.n_embed, 1), # confidence
         )
 
-    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
-        sequence = self.norm(torch.concat((recurrent, internal), dim=-2))
-        # -> (batch, seq, n_embed)
+    def forward(self, sequence: torch.Tensor):
+        # in: (batch, seq, n_embed)
+        sequence = self.norm(sequence)
 
         q = torch.stack((
             self.q_out.unsqueeze(0),
             self.q_halt.unsqueeze(0),
-        ), dim=0).unsqueeze(0)
-        # -> (batch, out/halt, "seq", n_embed)
+        ), dim=0)
+        # TODO: removed a q = q.unsqueeze(0) at the end, was it needed? (batch)
+        # -> (out/halt, "seq", n_embed)
 
         kv_merged = torch.stack((
             self.kv_linear_out(sequence).unflatten(-1, (2, self.n_embed)),
@@ -259,10 +191,41 @@ class OutputDecode(nn.Module):
         # (batch, out/halt, "seq", n_embed) -> (batch, n_embed)
         token_out = self.ff_out(attn_out[..., 0, 0, :])
         # -> (batch, 1)
-        confidence_out = self.ff_halt(attn_out[..., 1, 0, :])
+        confidence_out = self.ff_confidence(attn_out[..., 1, 0, :])
 
         # out: (batch, vocab_size), (batch)
         return token_out, confidence_out.squeeze(-1)
+
+class RNNPonder(nn.Module):
+    """
+    The part of the model rerun for ponder
+
+    Contains intermediate layers followed by the decode layer. Does not contain
+    the input layer, which should be run before.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.short_ctx_len = config.short_ctx_len
+        self.recurrent_seq_len = config.recurrent_seq_len
+
+        self.intermediate = nn.ModuleList(
+            IntermediateLayer(config) for _ in range(config.n_intermediate))
+        self.output = OutputDecode(config)
+
+    # recurrent is recurrent state, internal is output of input layer, or if
+    # pondering, the internal output of the previous RNNPonder step
+    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
+        # in: (batch, seq, n_embed)
+        sequence = torch.concat((recurrent, internal), dim=-2)
+        for layer in self.intermediate:
+            sequence = layer(sequence)
+
+        token_out, confidence_out = self.output(sequence)
+        recurrent, internal = torch.split(sequence, (
+            self.recurrent_seq_len, self.short_ctx_len
+        ), dim=-2)
+        return recurrent, internal, token_out, confidence_out
 
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -270,7 +233,6 @@ class RNNSequence(nn.Module):
         self.recurrent_init = nn.Parameter(torch.randn((config.recurrent_seq_len, config.n_embed)))
         self.input = InputLayer(config)
         self.ponder = RNNPonder(config)
-        self.decode = OutputDecode(config)
 
     def forward(self):
         # this module probably needs more than just forward()

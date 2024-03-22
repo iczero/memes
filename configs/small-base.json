@@ -1,0 +1,32 @@
+{
+  "model_config": {
+    "n_embed": 128,
+    "n_attention_heads": 8,
+    "vocab_size": 8192,
+    "short_ctx_len": 8,
+    "internal_seq_len": 16,
+    "ff_dropout_p": 0.0,
+    "attn_dropout_p": 0.0,
+    "n_intermediate": 4,
+    "resid_gate_multiplier": 2.0,
+    "activation": "gelu",
+    "dtype": "float32",
+    "qkv_bias": true,
+    "tokenizer_model_path": "data/tokenizer8-8k.model",
+    "ponder_adjust": 1.5
+  },
+  "train_config": {
+    "lr": 1e-4,
+    "weight_decay": 0.01,
+    "backspace_p": 0.01,
+    "batch_size": 32,
+    "truncate_steps": 32,
+    "accumulate_gradients": 1,
+    "clip_grad_norm": 5.0,
+    "min_p_halt": 0.5,
+    "optimizer": "AdamW",
+    "confidence_scale": 0.025,
+    "prev_loss_mean": 20.0,
+    "prev_loss_std": 1.0
+  }
+}

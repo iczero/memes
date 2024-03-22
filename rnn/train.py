@@ -187,8 +187,8 @@ class TrainHelper:
         prev_loss_mean: torch.Tensor,
         prev_loss_std: torch.Tensor,
     ):
-        next_recurrent, next_internal = self.model.ponder(recurrent, internal)
-        token_out, confidence_out = self.model.decode(next_recurrent, next_internal)
+        next_recurrent, next_internal, token_out, confidence_out = \
+            self.model.ponder(recurrent, internal)
 
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
         confidence_losses = self.train_config.confidence_scale * \
@@ -454,6 +454,8 @@ def main():
 
         torch.save(state, save_to)
 
+    accumulate_steps = 0
+
     while True:
         step += 1
         optimizer.zero_grad()
@@ -483,8 +485,14 @@ def main():
             print('\n\nerror: norm of gradients is too high, aborting:', grads_norm_f)
             raise RuntimeError(f'grads_norm too high: {grads_norm_f}')
 
-        optimizer.step()
-        trainer.truncate_backprop()
+        # might not work? not sure
+        #trainer.truncate_backprop()
+
+        accumulate_steps += 1
+        if accumulate_steps >= train_config.accumulate_gradients:
+            print('stepping optimizer')
+            optimizer.step()
+            accumulate_steps = 0
 
         if step % 25 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
             trainer.adjust_confidence_stats()
