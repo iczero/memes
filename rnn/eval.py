@@ -70,12 +70,10 @@ class InferenceHelper:
             self.recurrent, internal, token_logits, confidence_logit = \
                 self.model.ponder(self.recurrent, internal)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
-            print('p_halt:', confidence_logit.item(), p_halt.item())
             halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
             if halt:
                 return token_logits
 
-            print('<ponder>', end='', flush=True)
             ponder_count += 1
 
     def generate_tokens(self, limit = 256, max_ponder = 16, temperature = 1.0):
@@ -86,7 +84,7 @@ class InferenceHelper:
             token_logits = self.step(short_ctx, max_ponder)
             dist = (token_logits / temperature).softmax(-1)
             token = dist.multinomial(1).item()
-            yield token
+            yield token, dist
 
             if token == self.tokenizer['<del>']:
                 self.offset -= 1
@@ -101,8 +99,90 @@ class InferenceHelper:
             self.offset += 1
             self.step(self.current_context())
 
+    def noisy_step(self, short_ctx: torch.Tensor, max_ponder = 16):
+        internal = self.model.input(short_ctx)
+        halt = False
+        ponder_count = 0
+        while not halt:
+            self.recurrent, internal, token_logits, confidence_logit = \
+                self.model.ponder(self.recurrent, internal)
+            p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
+            halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
+            yield halt, ponder_count, confidence_logit, p_halt, token_logits
+            if halt:
+                return
+
+            ponder_count += 1
+
+    def noisy_generate(
+        self,
+        tokenizer: SentencePieceProcessor,
+        prompt: str | None = None,
+        max_ponder: int = 16,
+        limit: int = 128,
+        temperature: float = 1.0,
+    ):
+        in_tokens = [tokenizer['<s>']]
+        if prompt is not None:
+            in_tokens += tokenizer.Encode(prompt)
+
+        self.sequence[self.offset_end:] = in_tokens
+        input_end_offset = self.offset + len(in_tokens)
+
+        self.offset += 1
+        is_input = True
+        generated = 0
+        while generated < limit:
+            prev_is_input = is_input
+            if is_input and self.offset >= input_end_offset:
+                is_input = False
+
+            short_ctx = self.current_context()
+            selected_token = None
+            for halt, _ponder_count, confidence_logit, p_halt, token_logits \
+                in self.noisy_step(short_ctx, max_ponder):
+                confidence_f = confidence_logit.item()
+                p_halt_f = p_halt.item()
+                token_dist = (token_logits / temperature).softmax(-1)
+                top_tokens = torch.topk(token_dist, 5).indices.tolist()
+                if halt:
+                    halt_s = '*'
+                    if not is_input:
+                        selected_token = token_dist.multinomial(1).item()
+                        if selected_token not in top_tokens:
+                            top_tokens.append(selected_token)
+                else:
+                    halt_s = ' '
+
+                io_text = 'input: ' if is_input else 'output:'
+                display = f'{io_text} conf={confidence_f:+0.4f} halt={p_halt_f:0.4f} {halt_s} |'
+                if prev_is_input:
+                    last_input_token = repr(tokenizer.IdToPiece(self.sequence[self.offset_end - 1]))
+                    display += f' in: {last_input_token} |'
+                for token in top_tokens:
+                    token_p = token_dist[token]
+                    token_s = repr(tokenizer.IdToPiece(token))
+
+                    token_display = f'{token_s}:{token_p:0.2f}'
+                    if token == selected_token:
+                        token_display = f'[{token_display}]'
+
+                    display += ' ' + token_display
+
+                print(display)
+
+            assert is_input == (selected_token is None)
+            if selected_token is not None:
+                if selected_token == self.tokenizer['<del>']:
+                    self.offset -= 1
+                else:
+                    self.set_token(self.offset_end, selected_token)
+                    self.offset += 1
+                    generated += 1
+            else:
+                self.offset += 1
+
 def main():
-    # TODO: save this to serialized model or something
     checkpoint_file = sys.argv[1]
     device = torch.device('cpu')
     loaded = torch.load(checkpoint_file, map_location=device)
@@ -118,21 +198,10 @@ def main():
 
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)
-        print('input context: ', end='', flush=True)
-        infer.feed([tokenizer['<s>']])
-        if len(sys.argv) > 2:
-            content = tokenizer.Encode(sys.argv[2])
-            for token in content:
-                print(tokenizer.IdToPiece(token), end='', flush=True)
-                infer.feed([token])
+        prompt = sys.argv[2] if len(sys.argv) > 2 else None
+        infer.noisy_generate(tokenizer, prompt, temperature=0.75)
 
-        print('\n\ngenerated:')
-
-        for token in infer.generate_tokens(max_ponder=16):
-            print(tokenizer.IdToPiece(token), end='', flush=True)
-
-        print('\n\n================')
-        print('full sequence:')
+        print('\n============== full sequence:')
         print(tokenizer.Decode(infer.sequence))
 
 if __name__ == '__main__':

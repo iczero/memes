@@ -20,7 +20,7 @@
     "weight_decay": 0.01,
     "backspace_p": 0.01,
     "batch_size": 32,
-    "truncate_steps": 64,
+    "truncate_steps": 90,
     "accumulate_gradients": 1,
     "clip_grad_norm": 5.0,
     "min_p_halt": 0.35,

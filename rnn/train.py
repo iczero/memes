@@ -19,6 +19,7 @@ from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
+# this is a stupid constant and should proably not be here
 PONDER_ADJUST_LOOKBACK = 512
 "How many steps to look back to adjust ponder_loss_penalty"
 
@@ -127,6 +128,7 @@ class TrainHelper:
         input_sequences: list[torch.Tensor | None] = []
         output_list: list[torch.Tensor] = []
         for i, info in enumerate(self.sequences):
+            # short_ctx_l = None
             if info.prev_internal is not None:
                 assert i not in self.halted_sequences
                 input_sequences.append(info.prev_internal)
@@ -134,14 +136,14 @@ class TrainHelper:
                 assert i in self.halted_sequences
                 assert not info.ended
                 # prepare batch for input layer
-                short_ctx = info.sequence[info.offset : info.offset + short_ctx_len]
+                short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
                 if info.offset > 4 and torch.bernoulli(
                     torch.tensor(self.train_config.backspace_p)
                 ).item() > 0:
-                    short_ctx[-1] = random_token_not(len(self.tokenizer), short_ctx[-1])
+                    short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
                     info.offset -= 1
                     info.was_backspace = True
-                short_ctx = torch.tensor(short_ctx, dtype=torch.int64, device=self.device)
+                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device=self.device)
                 input_batch.append((i, short_ctx))
                 # will be substitued later
                 input_sequences.append(None)
@@ -154,24 +156,24 @@ class TrainHelper:
             next_token = torch.tensor(next_token, dtype=torch.int64, device=self.device)
             output_list.append(next_token)
 
+            # print('\nprepare_internal_batch(): sequences dump')
+            # if short_ctx_l is None:
+            #     short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
+            # print(
+            #     '  batch element:', i,
+            #     repr(''.join(self.tokenizer.IdToPiece(p) for p in short_ctx_l)),
+            #     '->',
+            #     repr(self.tokenizer.IdToPiece(next_token.item())),
+            # )
+
         if len(input_batch) > 0:
             # run input batch
             input_encode = torch.stack([v[1] for v in input_batch], dim=0)
             input_encode = self.forward_input_batch(input_encode)
 
-            # _tmp_idx = 0
             for item, encoded in zip(input_batch, input_encode):
                 # input_encode first dimension is batch
                 input_sequences[item[0]] = encoded
-
-                # print('\nprepare_internal_batch(): sequences dump')
-                # print(
-                #     '  batch element:', item[0],
-                #     repr(''.join(self.tokenizer.IdToPiece(p) for p in input_batch[_tmp_idx][1].tolist())),
-                #     '->',
-                #     repr(self.tokenizer.IdToPiece(output_list[item[0]].item())),
-                # )
-                # _tmp_idx += 1
 
         input_array = torch.stack(input_sequences, dim=0)
         output_array = torch.stack(output_list, dim=0)
@@ -287,7 +289,9 @@ class TrainHelper:
                 assert info.ended
                 continue
 
-            sequence_losses.append(torch.stack(info.losses).sum() / len(info.losses))
+            # losses for each individual ponder step should be summed
+            halt_steps = max(len(info.halted_losses), 1)
+            sequence_losses.append(torch.stack(info.losses).sum() / halt_steps)
 
         return torch.stack(sequence_losses).sum() / len(sequence_losses)
 
@@ -495,7 +499,7 @@ def main():
             optimizer.step()
             accumulate_steps = 0
 
-        if step % 25 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
+        if step % 10 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
             trainer.adjust_confidence_stats()
             trainer.track(trainer.train_config.prev_loss_mean, name='prev_loss_mean', step=step)
             trainer.track(trainer.train_config.prev_loss_std, name='prev_loss_std', step=step)
