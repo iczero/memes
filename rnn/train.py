@@ -19,7 +19,7 @@ from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
-PONDER_ADJUST_LOOKBACK = 2048
+PONDER_ADJUST_LOOKBACK = 512
 "How many steps to look back to adjust ponder_loss_penalty"
 
 @torch.jit.script
@@ -27,10 +27,16 @@ def confidence_loss(
     loss: torch.Tensor, confidence_logit: torch.Tensor,
     prev_mean: torch.Tensor, prev_std: torch.Tensor,
 ):
+    SQRT_2 = torch.sqrt(torch.tensor(2.))
     # rescale loss to standard normal, negate for high loss -> low confidence
     loss_normal = -(loss - prev_mean) / prev_std
-    # just square the error or something
-    return (confidence_logit - loss_normal) ** 2
+    # needs sqrt(2) due to normal/logistic regression cdf difference wrt. sigmoid/tanh
+    target_confidence = F.sigmoid(loss_normal * SQRT_2)
+    return F.binary_cross_entropy_with_logits(
+        confidence_logit,
+        target_confidence,
+        reduction='none'
+    )
 
 @dataclasses.dataclass
 class TrainSequence:
