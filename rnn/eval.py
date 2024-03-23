@@ -70,6 +70,7 @@ class InferenceHelper:
             self.recurrent, internal, token_logits, confidence_logit = \
                 self.model.ponder(self.recurrent, internal)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
+            print('p_halt:', confidence_logit.item(), p_halt.item())
             halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
             if halt:
                 return token_logits
