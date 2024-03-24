@@ -121,6 +121,8 @@ class InferenceHelper:
         max_ponder: int = 16,
         limit: int = 128,
         temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
     ):
         in_tokens = [tokenizer['<s>']]
         if prompt is not None:
@@ -128,8 +130,9 @@ class InferenceHelper:
 
         self.sequence[self.offset_end:] = in_tokens
         input_end_offset = self.offset + len(in_tokens)
-
         self.offset += 1
+
+        DELETE_TOKEN = self.tokenizer['<del>']
         is_input = True
         generated = 0
         while generated < limit:
@@ -141,39 +144,64 @@ class InferenceHelper:
             selected_token = None
             for halt, _ponder_count, confidence_logit, p_halt, token_logits \
                 in self.noisy_step(short_ctx, max_ponder):
+                token_logits = token_logits.to('cpu')
                 confidence_f = confidence_logit.item()
                 p_halt_f = p_halt.item()
-                token_dist = (token_logits / temperature).softmax(-1)
-                top_tokens = torch.topk(token_dist, 5).indices.tolist()
+
+                tokens_topk = torch.topk(token_logits, top_k)
+                tokens_topk_normalized = (tokens_topk.values / temperature).softmax(-1)
+                tokens_sorted, _sort_indices = tokens_topk_normalized.sort(dim=-1, descending=True)
+                tokens_indices = tokens_topk.indices[_sort_indices]
+                tokens_dist_cumulative = torch.cumsum(tokens_sorted, dim=-1)
+                # does not seem to be any good way to do this directly in torch
+                top_p_threshold = (tokens_dist_cumulative < top_p).tolist()
+                if False in top_p_threshold:
+                    max_index = top_p_threshold.index(False) + 1
+                    tokens_dist = tokens_sorted[..., :torch.tensor(max_index, device='cpu')]
+                else:
+                    tokens_dist = tokens_sorted
+
                 if halt:
                     halt_s = '*'
                     if not is_input:
-                        selected_token = token_dist.multinomial(1).item()
-                        if selected_token not in top_tokens:
-                            top_tokens.append(selected_token)
+                        # hack: always pick <del> if it's the top token, ignoring sampling
+                        if tokens_topk.indices[0].item() == DELETE_TOKEN:
+                            selected_token = DELETE_TOKEN
+                        else:
+                            selected_token = tokens_indices[tokens_dist.multinomial(1)].item()
                 else:
                     halt_s = ' '
 
                 io_text = 'input: ' if is_input else 'output:'
-                display = f'{io_text} conf={confidence_f:+0.4f} halt={p_halt_f:0.4f} {halt_s} |'
+                display = f'{io_text} conf={confidence_f:+0.4f} halt={p_halt_f:0.4f} {halt_s} | '
                 if prev_is_input:
                     last_input_token = repr(tokenizer.IdToPiece(self.sequence[self.offset_end - 1]))
-                    display += f' in: {last_input_token} |'
-                for token in top_tokens:
-                    token_p = token_dist[token]
+                    display += f'in: {last_input_token} | '
+                top_tokens_short = tokens_indices[:5].tolist()
+                if selected_token not in top_tokens_short and selected_token is not None:
+                    top_tokens_short.append(selected_token)
+
+                mapping_list = tokens_indices.tolist()
+                selected_token_display = None
+                tokens_display = []
+                for token in top_tokens_short:
+                    token_p = tokens_sorted[mapping_list.index(token)]
                     token_s = repr(tokenizer.IdToPiece(token))
 
                     token_display = f'{token_s}:{token_p:0.2f}'
                     if token == selected_token:
-                        token_display = f'[{token_display}]'
+                        selected_token_display = f'[{token_display}]'
+                    else:
+                        tokens_display.append(token_display)
 
-                    display += ' ' + token_display
-
+                if selected_token_display is not None:
+                    display += selected_token_display + ' '
+                display += ' '.join(tokens_display)
                 print(display)
 
             assert is_input == (selected_token is None)
             if selected_token is not None:
-                if selected_token == self.tokenizer['<del>']:
+                if selected_token == DELETE_TOKEN:
                     self.offset -= 1
                 else:
                     self.set_token(self.offset_end, selected_token)
@@ -199,7 +227,7 @@ def main():
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)
         prompt = sys.argv[2] if len(sys.argv) > 2 else None
-        infer.noisy_generate(tokenizer, prompt, temperature=0.75)
+        infer.noisy_generate(tokenizer, prompt, temperature=0.9)
 
         print('\n============== full sequence:')
         print(tokenizer.Decode(infer.sequence))

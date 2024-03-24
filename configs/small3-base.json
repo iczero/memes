@@ -1,7 +1,7 @@
 {
   "model_config": {
-    "n_embed": 128,
-    "n_attention_heads": 8,
+    "n_embed": 176,
+    "n_attention_heads": 6,
     "vocab_size": 8192,
     "short_ctx_len": 8,
     "internal_seq_len": 16,
@@ -20,7 +20,7 @@
     "weight_decay": 0.01,
     "backspace_p": 0.01,
     "batch_size": 32,
-    "truncate_steps": 96,
+    "truncate_steps": 90,
     "accumulate_gradients": 1,
     "clip_grad_norm": 3.0,
     "min_p_halt": 0.35,

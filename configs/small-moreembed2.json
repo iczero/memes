@@ -22,7 +22,7 @@
     "batch_size": 32,
     "truncate_steps": 90,
     "accumulate_gradients": 1,
-    "clip_grad_norm": 5.0,
+    "clip_grad_norm": 3.0,
     "min_p_halt": 0.35,
     "optimizer": "AdamW",
     "confidence_scale": 0.025,
