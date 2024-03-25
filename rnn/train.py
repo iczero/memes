@@ -96,11 +96,11 @@ class TrainHelper:
 
         self.sequence_provider = None
 
-    def next_sequence(self, index: int) -> list[int]:
+    def next_sequence(self) -> list[int]:
         if self.sequence_provider is None:
             raise RuntimeError('sequence_provider not provided')
 
-        return self.sequence_provider.next_sequence_for(index)
+        return self.sequence_provider.next_sequence()
 
     def next_batch(self):
         batch_size = self.train_config.batch_size
@@ -108,9 +108,9 @@ class TrainHelper:
             .unsqueeze(0).repeat_interleave(batch_size, 0)
         self.sequences = [
             TrainSequence(
-                sequence=self.next_sequence(i),
+                sequence=self.next_sequence(),
                 p_not_halt=torch.tensor(1., dtype=self.dtype, device=self.device),
-            ) for i in range(batch_size)
+            ) for _ in range(batch_size)
         ]
         self.halted_sequences = list(range(batch_size))
 
@@ -428,7 +428,8 @@ def main():
             yield text
 
     trainer.sequence_provider = SequenceProvider(
-        batch_size=train_config.batch_size,
+        # TODO: actually preprocess data or something
+        n_sequences=1024,
         text_loader=filter_text(data_iter),
         tokenizer=tokenizer,
         short_ctx_len=model_config.short_ctx_len,

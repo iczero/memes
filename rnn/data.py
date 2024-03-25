@@ -3,6 +3,7 @@ import re
 import warnings
 from collections.abc import Iterable
 
+import numpy as np
 import zstandard
 from sentencepiece import SentencePieceProcessor
 
@@ -28,7 +29,7 @@ def load_dataset(in_stream):
         warnings.warn('dataset file did not end with newline')
 
 class SequenceProvider:
-    batch_size: int
+    n_sequences: int
     states: list[Iterable[list[int]]]
     text_loader: Iterable[str]
     tokenizer: SentencePieceProcessor
@@ -43,18 +44,18 @@ class SequenceProvider:
 
     def __init__(
         self,
-        batch_size: int,
+        n_sequences: int,
         text_loader: Iterable[str],
         tokenizer: SentencePieceProcessor,
         short_ctx_len: int,
         target_seq_len: int,
     ):
-        self.batch_size = batch_size
+        self.n_sequences = n_sequences
         self.text_loader = text_loader
         self.tokenizer = tokenizer
         self.short_ctx_len = short_ctx_len
         self.target_seq_len = target_seq_len
-        self.states = [None] * batch_size
+        self.states = [None] * n_sequences
         self.seq_len_high_threshold = int(target_seq_len * 1.1)
         self.seq_len_low_threshold = int(target_seq_len * 0.8)
         self.text_fragment_max_len = int(target_seq_len * 512)
@@ -111,10 +112,8 @@ class SequenceProvider:
                 yield self.wrap_sequence(tokens)
                 return
 
-    def next_sequence_for(self, index: int):
-        if index >= len(self.states):
-            raise ValueError('index out of range')
-
+    def next_sequence(self):
+        index = np.random.randint(0, len(self.states))
         while True:
             current = self.states[index]
             try:

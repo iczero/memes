@@ -12,12 +12,12 @@
   - construct multiple TrainHelper instances, one per "sub-batch"
 - make training more data-efficient
   - maybe try truncated BPTT again
-  - segment text with heuristics, run each segment instead of only the first bit
-    of each document
+  - (DONE) segment text with heuristics, run each segment instead of only the
+    first bit of each document
 - run a smaller dataset
-  - extract "high quality" sources from the pile or some other dataset
-  - retrain tokenizer on that dataset
-  - definitely attempt to exclude code or Advanced Biology™ from the set
+  - (done?) extract "high quality" sources from the pile or some other dataset
+  - (DONE) retrain tokenizer on that dataset
+  - (DONE) definitely attempt to exclude code or Advanced Biology™ from the set
 - figure out why reduced precision (bf16) doesn't converge
   - is it residual gating?
 - update the diagram
