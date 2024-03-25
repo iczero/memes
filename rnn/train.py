@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import json
+import signal
 import sys
 
 import aim
@@ -15,7 +16,7 @@ from .common import ModelConfig, TrainConfig, random_token_not
 from .data import SequenceProvider, load_dataset
 from .model import RNNSequence
 
-DISABLE_TORCH_COMPILE = True
+DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
 # this is a stupid constant and should proably not be here
 PONDER_ADJUST_LOOKBACK = 512
@@ -231,7 +232,7 @@ class TrainHelper:
                 continue
 
             p_halt_detached: torch.Tensor = torch.max(
-                p_halt_out[i].clone().detach().to('cpu'),
+                p_halt_out[i].detach().to('cpu'),
                 torch.tensor(self.train_config.min_p_halt, device='cpu'),
             )
             did_halt = p_halt_detached.bernoulli() > 0
@@ -239,13 +240,13 @@ class TrainHelper:
             # P(halt | not previously halted) * ponder step loss
             weighted_loss = info.p_not_halt * p_halt_detached * cross_entropy[i] + confidence_losses[i]
             info.losses.append(weighted_loss)
-            info.confidence_losses.append(confidence_losses[i].clone().detach().to('cpu'))
+            info.confidence_losses.append(confidence_losses[i].detach().to('cpu'))
 
             if did_halt:
                 info.prev_internal = None
                 info.p_not_halt.copy_(1.)
                 # record unweighted loss as well
-                info.halted_losses.append(cross_entropy[i].clone().detach().to('cpu'))
+                info.halted_losses.append(cross_entropy[i].detach().to('cpu'))
 
                 # check if sequence ended
                 # we end one token before the last otherwise there is no "next" token to train on
@@ -447,6 +448,14 @@ def main():
     done_count = train_config.batch_size
     done_threshold = train_config.batch_size // 3 * 2
 
+    checkpoint_now = False
+    def handle_checkpoint_signal(_signum, _frame):
+        nonlocal checkpoint_now
+        print('signal received, queueing checkpoint...')
+        checkpoint_now = True
+
+    signal.signal(signal.SIGUSR2, handle_checkpoint_signal)
+
     def save_checkpoint(save_to: str):
         state = {
             'model_config': model_config.to_dict(),
@@ -506,7 +515,8 @@ def main():
             trainer.track(trainer.train_config.prev_loss_mean, name='prev_loss_mean', step=step)
             trainer.track(trainer.train_config.prev_loss_std, name='prev_loss_std', step=step)
 
-        if step % 1000 == 0:
+        if step % 1000 == 0 or checkpoint_now:
+            checkpoint_now = False
             save_path = checkpoint_path + '.' + str(int(datetime.datetime.now().timestamp()))
             save_checkpoint(save_path)
             print('checkpoint saved to', save_path)
