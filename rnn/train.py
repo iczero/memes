@@ -1,19 +1,18 @@
 import dataclasses
 import datetime
 import json
-import re
 import sys
-from collections.abc import Iterable
 
 import aim
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch._dynamo.config
+import torch.nn.functional as F
 from sentencepiece import SentencePieceProcessor
 from torch import nn
 
-from .common import ModelConfig, TrainConfig, load_dataset, random_token_not
+from .common import ModelConfig, TrainConfig, random_token_not
+from .data import SequenceProvider, load_dataset
 from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = True
@@ -68,8 +67,7 @@ class TrainHelper:
     model: RNNSequence
     recurrent: torch.Tensor
     tokenizer: SentencePieceProcessor
-    train_iter: Iterable[str]
-    "Previous batched internal state, if reusable"
+    sequence_provider: SequenceProvider
     halted_sequences: list[int]
     "List of sequences by index which halted the last step"
     prev_unweighted_losses: list[float]
@@ -84,7 +82,6 @@ class TrainHelper:
         tokenizer: SentencePieceProcessor,
         device: torch.device,
         dtype: torch.dtype,
-        train_iter: Iterable[list[int]],
     ):
         self.model_config = model_config
         self.train_config = train_config
@@ -97,11 +94,13 @@ class TrainHelper:
         self.model.to(self.device)
         self.model.train()
 
-        self.train_iter = train_iter
+        self.sequence_provider = None
 
-    def next_sequence(self) -> list[int]:
-        # TODO: what if this implodes
-        return next(self.train_iter)
+    def next_sequence(self, index: int) -> list[int]:
+        if self.sequence_provider is None:
+            raise RuntimeError('sequence_provider not provided')
+
+        return self.sequence_provider.next_sequence_for(index)
 
     def next_batch(self):
         batch_size = self.train_config.batch_size
@@ -109,9 +108,9 @@ class TrainHelper:
             .unsqueeze(0).repeat_interleave(batch_size, 0)
         self.sequences = [
             TrainSequence(
-                sequence=self.next_sequence(),
+                sequence=self.next_sequence(i),
                 p_not_halt=torch.tensor(1., dtype=self.dtype, device=self.device),
-            ) for _ in range(batch_size)
+            ) for i in range(batch_size)
         ]
         self.halted_sequences = list(range(batch_size))
 
@@ -380,14 +379,7 @@ def main():
         tokenizer.Init(model_file=model_config.tokenizer_model_path)
 
         dtype = model_config.get_dtype()
-        trainer = TrainHelper(
-            model_config,
-            train_config,
-            tokenizer,
-            device,
-            dtype,
-            train_iter=None, # placeholder
-        )
+        trainer = TrainHelper(model_config, train_config, tokenizer, device, dtype)
         trainer.aim_run = aim.Run()
         trainer.aim_run['model_config'] = model_config.to_dict()
         trainer.aim_run['train_config'] = train_config.to_dict()
@@ -401,14 +393,7 @@ def main():
         train_config = TrainConfig.from_dict(loaded['train_config'])
         tokenizer = SentencePieceProcessor()
         tokenizer.Init(model_file=model_config.tokenizer_model_path)
-        trainer = TrainHelper(
-            model_config,
-            train_config,
-            tokenizer,
-            device,
-            model_config.get_dtype(),
-            train_iter=None,
-        )
+        trainer = TrainHelper(model_config, train_config, tokenizer, device, model_config.get_dtype())
         print('loading model')
         trainer.model.load_state_dict(loaded['model_state'])
 
@@ -430,24 +415,9 @@ def main():
         return
 
     data_file = open(data_path, 'rb')
-    # TODO: fix this
     data_iter = load_dataset(data_file)
 
-    PAD_TOKEN = tokenizer['<pad>']
-    TEXT_START_TOKEN = tokenizer['<s>']
-    TEXT_END_TOKEN = tokenizer['</s>']
-
-    def wrap_sequence(tokens: list[int]):
-        pad_start = [PAD_TOKEN] * (model_config.short_ctx_len - 1) + [TEXT_START_TOKEN]
-        last = [TEXT_END_TOKEN]
-        return pad_start + tokens + last
-
-    def make_sequences(data):
-        ctx_len_high_threshold = train_config.truncate_steps * 1.1
-        ctx_len_low_threshold = train_config.truncate_steps * 0.5
-        # should probably find max length of any token but whatever
-        fragment_max_len = train_config.truncate_steps * 512
-        end_paragraph = re.compile(r'\n(?:[-=~]*\n+)?')
+    def filter_text(data):
         for _count, set_name, text in data:
             if set_name not in (
                 'BookCorpus2', 'Books3', 'Enron Emails', 'Gutenberg (PG-19)',
@@ -455,40 +425,16 @@ def main():
             ):
                 continue
 
-            current_pos = 0
-            while len(text) - current_pos > 0:
-                tokens = tokenizer.Encode(text[current_pos : current_pos + fragment_max_len])
-                if len(tokens) < ctx_len_low_threshold:
-                    if current_pos == 0:
-                        # send if it isn't something we've truncated
-                        yield wrap_sequence(tokens)
-                    # otherwise discard
-                    break
+            yield text
 
-                if len(tokens) < ctx_len_high_threshold:
-                    yield wrap_sequence(tokens)
-                    break
+    trainer.sequence_provider = SequenceProvider(
+        batch_size=train_config.batch_size,
+        text_loader=filter_text(data_iter),
+        tokenizer=tokenizer,
+        short_ctx_len=model_config.short_ctx_len,
+        target_seq_len=train_config.truncate_steps,
+    )
 
-                should_continue = False
-                end_matches = end_paragraph.finditer(text, pos=current_pos)
-                for end_match in end_matches:
-                    fragment = text[current_pos : end_match.start()]
-                    tokens = tokenizer.Encode(fragment)
-                    if len(tokens) < ctx_len_low_threshold:
-                        # don't send a fragment that's too short
-                        continue
-
-                    should_continue = True
-                    current_pos = end_match.end()
-                    yield wrap_sequence(tokens)
-                    break
-
-                if not should_continue:
-                    # either no paragraph separator or no good match
-                    yield wrap_sequence(tokens)
-                    break
-
-    trainer.train_iter = make_sequences(data_iter)
     model = trainer.model
     optimizer = train_config.make_optimizer(model.parameters())
 

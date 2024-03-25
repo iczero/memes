@@ -154,41 +154,12 @@ class TrainConfig:
                 weight_decay=self.weight_decay
             )
 
-def load_dataset(in_stream):
-    dctx = zstandard.ZstdDecompressor()
-    count = 0
-    buffer = bytearray()
-    for chunk in dctx.read_to_iter(in_stream):
-        buffer += chunk
-        lines = buffer.split(b'\n')
-        buffer[:] = lines[-1]
-        for line in lines[0:-1]:
-            obj = json.loads(line)
-            text = obj['text']
-            set_name = obj['meta']['pile_set_name']
-            if len(text) > 0:
-                yield count, set_name, text
-            count += 1
-
-    if len(buffer) > 0:
-        warnings.warn('dataset file did not end with newline')
-
 def random_token_not(total: int, not_token: int):
     "Generate a random token id that is not the provided token"
     while True:
         token = torch.randint(0, total, tuple()).item()
         if token != not_token:
             return token
-
-def tokenize_input(
-    sp: SentencePieceProcessor,
-    ctx_len: int,
-    sequence: str,
-):
-    pad_start = [sp['<pad>']] * (ctx_len - 1) + [sp['<s>']]
-    last = [sp['</s>']]
-    encoded = sp.encode(sequence, out_type=int)
-    return pad_start + encoded + last
 
 # why doesn't safetensors support loading metadata?
 def safetensors_load_metadata(filename):
