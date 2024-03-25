@@ -12,7 +12,7 @@
     "activation": "gelu",
     "dtype": "float32",
     "qkv_bias": true,
-    "tokenizer_model_path": "data/tokenizer8-8k.model",
+    "tokenizer_model_path": "data/tokenizer9-8k.model",
     "ponder_adjust": 1.25
   },
   "train_config": {
