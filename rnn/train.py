@@ -219,6 +219,10 @@ class TrainHelper:
                 ),
             )
 
+        p_halt_out_detached = p_halt_out.detach().to('cpu')
+        confidence_losses_detached = confidence_losses.detach().to('cpu')
+        cross_entropy_detached = cross_entropy.detach().to('cpu')
+
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
 
@@ -232,7 +236,7 @@ class TrainHelper:
                 continue
 
             p_halt_detached: torch.Tensor = torch.max(
-                p_halt_out[i].detach().to('cpu'),
+                p_halt_out_detached[i],
                 torch.tensor(self.train_config.min_p_halt, device='cpu'),
             )
             did_halt = p_halt_detached.bernoulli() > 0
@@ -240,13 +244,13 @@ class TrainHelper:
             # P(halt | not previously halted) * ponder step loss
             weighted_loss = info.p_not_halt * p_halt_detached * cross_entropy[i] + confidence_losses[i]
             info.losses.append(weighted_loss)
-            info.confidence_losses.append(confidence_losses[i].detach().to('cpu'))
+            info.confidence_losses.append(confidence_losses_detached[i])
 
             if did_halt:
                 info.prev_internal = None
                 info.p_not_halt.copy_(1.)
                 # record unweighted loss as well
-                info.halted_losses.append(cross_entropy[i].detach().to('cpu'))
+                info.halted_losses.append(cross_entropy_detached[i])
 
                 # check if sequence ended
                 # we end one token before the last otherwise there is no "next" token to train on
