@@ -141,7 +141,7 @@ class TrainHelper:
                     short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
                     info.offset -= 1
                     info.was_backspace = True
-                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device=self.device)
+                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu')
                 input_batch.append((i, short_ctx))
                 # will be substitued later
                 input_sequences.append(None)
@@ -151,7 +151,7 @@ class TrainHelper:
                 next_token = self.tokenizer['<del>']
             else:
                 next_token = info.sequence[info.offset + short_ctx_len]
-            next_token = torch.tensor(next_token, dtype=torch.int64, device=self.device)
+            next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu')
             output_list.append(next_token)
 
             # print('\nprepare_internal_batch(): sequences dump')
@@ -166,7 +166,7 @@ class TrainHelper:
 
         if len(input_batch) > 0:
             # run input batch
-            input_encode = torch.stack([v[1] for v in input_batch], dim=0)
+            input_encode = torch.stack([v[1] for v in input_batch], dim=0).to(self.device)
             input_encode = self.forward_input_batch(input_encode)
 
             for item, encoded in zip(input_batch, input_encode):
@@ -174,7 +174,7 @@ class TrainHelper:
                 input_sequences[item[0]] = encoded
 
         input_array = torch.stack(input_sequences, dim=0)
-        output_array = torch.stack(output_list, dim=0)
+        output_array = torch.stack(output_list, dim=0).to(self.device)
 
         return input_array, output_array
 
@@ -242,7 +242,7 @@ class TrainHelper:
             did_halt = p_halt_detached.bernoulli() > 0
 
             # P(halt | not previously halted) * ponder step loss
-            weighted_loss = info.p_not_halt * p_halt_detached * cross_entropy[i] + confidence_losses[i]
+            weighted_loss = info.p_not_halt * p_halt_out[i].detach() * cross_entropy[i] + confidence_losses[i]
             info.losses.append(weighted_loss)
             info.confidence_losses.append(confidence_losses_detached[i])
 
@@ -434,7 +434,7 @@ def main():
 
     trainer.sequence_provider = SequenceProvider(
         # TODO: actually preprocess data or something
-        n_sequences=1024,
+        n_sequences=2048,
         text_loader=filter_text(data_iter),
         tokenizer=tokenizer,
         short_ctx_len=model_config.short_ctx_len,

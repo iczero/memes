@@ -7,6 +7,8 @@ from sentencepiece import SentencePieceProcessor
 from .model import ModelConfig, RNNSequence
 
 
+DISABLE_TORCH_COMPILE = True
+
 class InferenceHelper:
     config: ModelConfig
     "Model config"
@@ -99,13 +101,21 @@ class InferenceHelper:
             self.offset += 1
             self.step(self.current_context())
 
+    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    def _forward_input(self, short_ctx: torch.Tensor):
+        return self.model.input(short_ctx)
+
+    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    def _forward_ponder(self, recurrent: torch.Tensor, internal: torch.Tensor):
+        return self.model.ponder(recurrent, internal)
+
     def noisy_step(self, short_ctx: torch.Tensor, max_ponder = 16):
-        internal = self.model.input(short_ctx)
+        internal = self._forward_input(short_ctx)
         halt = False
         ponder_count = 0
         while not halt:
             self.recurrent, internal, token_logits, confidence_logit = \
-                self.model.ponder(self.recurrent, internal)
+                self._forward_ponder(self.recurrent, internal)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
             halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
             yield halt, ponder_count, confidence_logit, p_halt, token_logits
