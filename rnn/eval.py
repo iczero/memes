@@ -227,7 +227,7 @@ def main():
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)
         prompt = sys.argv[2] if len(sys.argv) > 2 else None
-        infer.noisy_generate(tokenizer, prompt, temperature=0.9)
+        infer.noisy_generate(tokenizer, prompt, temperature=0.7, top_p=0.7)
 
         print('\n============== full sequence:')
         print(tokenizer.Decode(infer.sequence))

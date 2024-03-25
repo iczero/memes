@@ -165,8 +165,9 @@ def load_dataset(in_stream):
         for line in lines[0:-1]:
             obj = json.loads(line)
             text = obj['text']
+            set_name = obj['meta']['pile_set_name']
             if len(text) > 0:
-                yield count, text
+                yield count, set_name, text
             count += 1
 
     if len(buffer) > 0:

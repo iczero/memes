@@ -35,12 +35,18 @@ def main():
             buffer[:] = lines[-1]
             for line in lines[0:-1]:
                 obj = json.loads(line)
+                set_name = obj['meta']['pile_set_name']
+                if set_name not in (
+                    'BookCorpus2', 'Books3', 'Enron Emails', 'Gutenberg (PG-19)',
+                    'HackerNews', 'OpenWebText2', 'Ubuntu IRC', 'Wikipedia (en)'
+                ):
+                    continue
                 yield obj['text']
                 sentences += 1
                 if sentences % 100 == 0:
                     file_wrap.pbar.set_description(f'sentences: {sentences}', refresh=False)
 
-                if sentences >= 393216:
+                if sentences >= 163840:
                     file_wrap.pbar.set_description(
                         f'sentences: {sentences}, input loading done', refresh=True
                     )
@@ -51,7 +57,7 @@ def main():
         model_type='unigram',
         model_prefix=out_prefix,
         vocab_size=8192,
-        max_sentence_length=16384,
+        max_sentence_length=1048576,
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,
         normalization_rule_name='nfkc',

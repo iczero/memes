@@ -5,3 +5,4 @@ aim
 safetensors
 tqdm
 zstandard
+pyarrow
