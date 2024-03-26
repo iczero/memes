@@ -219,9 +219,10 @@ class TrainHelper:
                 ),
             )
 
-        p_halt_out_detached = p_halt_out.detach().to('cpu')
-        confidence_losses_detached = confidence_losses.detach().to('cpu')
-        cross_entropy_detached = cross_entropy.detach().to('cpu')
+        p_halt_out_detached = p_halt_out.detach()
+        p_halt_out_cpu = p_halt_out_detached.to('cpu', non_blocking=True)
+        confidence_losses_cpu = confidence_losses.detach().to('cpu', non_blocking=True)
+        cross_entropy_cpu = cross_entropy.detach().to('cpu', non_blocking=True)
 
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
@@ -235,22 +236,22 @@ class TrainHelper:
                 ended_count += 1
                 continue
 
-            p_halt_detached: torch.Tensor = torch.max(
-                p_halt_out_detached[i],
+            p_halt_detached_cpu: torch.Tensor = torch.max(
+                p_halt_out_cpu[i],
                 torch.tensor(self.train_config.min_p_halt, device='cpu'),
             )
-            did_halt = p_halt_detached.bernoulli() > 0
+            did_halt = p_halt_detached_cpu.bernoulli() > 0
 
             # P(halt | not previously halted) * ponder step loss
-            weighted_loss = info.p_not_halt * p_halt_out[i].detach() * cross_entropy[i] + confidence_losses[i]
+            weighted_loss = info.p_not_halt * p_halt_out_detached[i] * cross_entropy[i] + confidence_losses[i]
             info.losses.append(weighted_loss)
-            info.confidence_losses.append(confidence_losses_detached[i])
+            info.confidence_losses.append(confidence_losses_cpu[i])
 
             if did_halt:
                 info.prev_internal = None
-                info.p_not_halt.copy_(1.)
+                info.p_not_halt.copy_(1., non_blocking=True)
                 # record unweighted loss as well
-                info.halted_losses.append(cross_entropy_detached[i])
+                info.halted_losses.append(cross_entropy_cpu[i])
 
                 # check if sequence ended
                 # we end one token before the last otherwise there is no "next" token to train on
@@ -270,7 +271,7 @@ class TrainHelper:
                     self.halted_sequences.append(i)
             else:
                 info.prev_internal = next_internal[i]
-                info.p_not_halt *= 1 - p_halt_detached
+                info.p_not_halt *= 1 - p_halt_detached_cpu
 
         return ended_count
 
@@ -453,12 +454,18 @@ def main():
     done_threshold = train_config.batch_size // 3 * 2
 
     checkpoint_now = False
-    def handle_checkpoint_signal(_signum, _frame):
-        nonlocal checkpoint_now
+    graceful_exit = False
+    def handle_signal(signum, _frame):
+        nonlocal checkpoint_now, graceful_exit
         print('signal received, queueing checkpoint...')
         checkpoint_now = True
 
-    signal.signal(signal.SIGUSR2, handle_checkpoint_signal)
+        # supposedly SIGQUIT is supposed to dump core but whatever
+        if signum == signal.SIGQUIT:
+            graceful_exit = True
+
+    signal.signal(signal.SIGUSR2, handle_signal)
+    signal.signal(signal.SIGQUIT, handle_signal)
 
     def save_checkpoint(save_to: str):
         state = {
@@ -525,5 +532,11 @@ def main():
             save_checkpoint(save_path)
             print('checkpoint saved to', save_path)
 
+            if graceful_exit:
+                print('exiting gracefully...')
+                break
+
 if __name__ == '__main__':
+    #import cProfile
+    #cProfile.run('main()', sort='tottime')
     main()

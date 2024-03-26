@@ -64,6 +64,9 @@ class InferenceHelper:
         else:
             self.sequence[index] = token
 
+    def get_output(self):
+        return self.sequence[self.config.short_ctx_len : self.offset_end]
+
     def step(self, short_ctx: torch.Tensor, max_ponder = 16) -> torch.Tensor:
         internal = self.model.input(short_ctx)
         halt = False
@@ -237,10 +240,10 @@ def main():
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)
         prompt = sys.argv[2] if len(sys.argv) > 2 else None
-        infer.noisy_generate(tokenizer, prompt, temperature=0.7, top_p=0.7)
+        infer.noisy_generate(tokenizer, prompt, temperature=0.7, top_p=0.9)
 
         print('\n============== full sequence:')
-        print(tokenizer.Decode(infer.sequence))
+        print(tokenizer.Decode(infer.get_output()))
 
 if __name__ == '__main__':
     main()
