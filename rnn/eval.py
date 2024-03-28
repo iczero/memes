@@ -42,6 +42,11 @@ class InferenceHelper:
         self.dtype = dtype
         self.sequence = []
 
+        # needed to fix rope
+        model.type(dtype)
+        model.to(device)
+        model.eval()
+
         self.initialize()
 
     def initialize(self):
@@ -231,16 +236,20 @@ def main():
     model = RNNSequence(config)
     model.load_state_dict(loaded['model_state'])
     dtype = config.get_dtype()
-    # needed to fix rope
-    model.type(dtype)
-    model.to(device)
     tokenizer = SentencePieceProcessor()
     tokenizer.Init(model_file=config.tokenizer_model_path)
 
     with torch.inference_mode():
         infer = InferenceHelper(config, model, tokenizer, device, dtype)
         prompt = sys.argv[2] if len(sys.argv) > 2 else None
-        infer.noisy_generate(tokenizer, prompt, temperature=0.7, top_p=0.9)
+        infer.noisy_generate(
+            tokenizer,
+            prompt,
+            max_ponder=4,
+            temperature=0.7,
+            top_k=50,
+            top_p=0.7,
+        )
 
         print('\n============== full sequence:')
         print(tokenizer.Decode(infer.get_output()))

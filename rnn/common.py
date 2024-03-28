@@ -1,12 +1,9 @@
 import dataclasses
 import json
 import struct
-import warnings
 from typing import Self
 
 import torch
-import zstandard
-from sentencepiece import SentencePieceProcessor
 from torch import nn
 
 
@@ -102,7 +99,7 @@ class TrainConfig:
     batch_size: int
     "Batch size"
     truncate_steps: int
-    "Max steps to run training (temporary)"
+    "Max sequence length during training. Truncated BPTT didn't work and was removed"
     accumulate_gradients: int
     "How many batches to run before running the optimizer step"
     clip_grad_norm: float
@@ -145,13 +142,13 @@ class TrainConfig:
                 self.lr,
                 # test
                 betas=(0.8, 0.95),
-                weight_decay=self.weight_decay
+                weight_decay=self.weight_decay,
             )
         elif self.optimizer == 'SGD':
             return torch.optim.SGD(
                 parameters,
                 self.lr,
-                weight_decay=self.weight_decay
+                weight_decay=self.weight_decay,
             )
 
 def random_token_not(total: int, not_token: int):

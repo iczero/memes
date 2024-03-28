@@ -18,9 +18,6 @@ from .model import RNNSequence
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
-# this is a stupid constant and should proably not be here
-PONDER_ADJUST_LOOKBACK = 512
-"How many steps to look back to adjust ponder_loss_penalty"
 
 @torch.jit.script
 def confidence_loss(
@@ -59,43 +56,40 @@ class TrainSequence:
     was_backspace: bool = False
     "If the last token was randomized for backspace"
 
-class TrainHelper:
+class TrainBatch:
     model_config: ModelConfig
     train_config: TrainConfig
     device: torch.device
     dtype: torch.dtype
     sequences: list[TrainSequence]
     model: RNNSequence
-    recurrent: torch.Tensor
+    recurrent: torch.Tensor | None = None
     tokenizer: SentencePieceProcessor
     sequence_provider: SequenceProvider
     halted_sequences: list[int]
     "List of sequences by index which halted the last step"
-    prev_unweighted_losses: list[float]
-    "List of previous unweighted losses for adjusting ponder_loss_penalty"
-    aim_run: aim.Run | None = None
-    "Aim run instance for run tracking"
+    batch_size: int
+    "Size of this batch"
 
     def __init__(
         self,
+        model: RNNSequence,
         model_config: ModelConfig,
         train_config: TrainConfig,
         tokenizer: SentencePieceProcessor,
         device: torch.device,
         dtype: torch.dtype,
+        batch_size: int,
+        sequence_provider: SequenceProvider,
     ):
         self.model_config = model_config
         self.train_config = train_config
         self.device = device
         self.dtype = dtype
         self.tokenizer = tokenizer
-        self.prev_unweighted_losses = []
-        self.model = RNNSequence(model_config)
-        self.model.type(self.dtype)
-        self.model.to(self.device)
-        self.model.train()
-
-        self.sequence_provider = None
+        self.model = model
+        self.batch_size = batch_size
+        self.sequence_provider = sequence_provider
 
     def next_sequence(self) -> list[int]:
         if self.sequence_provider is None:
@@ -103,17 +97,23 @@ class TrainHelper:
 
         return self.sequence_provider.next_sequence()
 
+    def reset(self):
+        "Free resources or something"
+        # i have no idea what i'm doing
+        self.recurrent = None
+        self.sequences.clear()
+        self.halted_sequences.clear()
+
     def next_batch(self):
-        batch_size = self.train_config.batch_size
         self.recurrent = self.model.recurrent_init \
-            .unsqueeze(0).repeat_interleave(batch_size, 0)
+            .unsqueeze(0).repeat_interleave(self.batch_size, 0)
         self.sequences = [
             TrainSequence(
                 sequence=self.next_sequence(),
                 p_not_halt=torch.tensor(1., dtype=self.dtype, device=self.device),
-            ) for _ in range(batch_size)
+            ) for _ in range(self.batch_size)
         ]
-        self.halted_sequences = list(range(batch_size))
+        self.halted_sequences = list(range(self.batch_size))
 
     @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
     def forward_input_batch(self, input_encode: torch.Tensor):
@@ -285,8 +285,7 @@ class TrainHelper:
             if info.prev_internal is not None:
                 info.prev_internal = info.prev_internal.detach()
 
-    def sum_train_loss(self) -> torch.Tensor:
-        sequence_losses = []
+    def iter_train_losses(self):
         for info in self.sequences:
             if len(info.losses) == 0:
                 assert info.ended
@@ -294,25 +293,17 @@ class TrainHelper:
 
             # losses for each individual ponder step should be summed
             halt_steps = max(len(info.halted_losses), 1)
-            sequence_losses.append(torch.stack(info.losses).sum() / halt_steps)
+            yield torch.stack(info.losses).sum() / halt_steps
 
-        return torch.stack(sequence_losses).sum() / len(sequence_losses)
-
-    def sum_unweighted_loss(self) -> torch.Tensor:
-        sequence_losses = []
+    def iter_unweighted_losses(self):
         for info in self.sequences:
             if len(info.halted_losses) == 0:
                 continue
 
             seq_mean = torch.stack(info.halted_losses).sum() / len(info.halted_losses)
-            sequence_losses.append(seq_mean)
-            self.prev_unweighted_losses.append(seq_mean.item())
-            if len(self.prev_unweighted_losses) > PONDER_ADJUST_LOOKBACK * 2:
-                self.prev_unweighted_losses = self.prev_unweighted_losses[PONDER_ADJUST_LOOKBACK:]
+            yield seq_mean
 
-        return torch.stack(sequence_losses).sum() / len(sequence_losses)
-
-    def sum_confidence_losses(self) -> torch.Tensor:
+    def iter_confidence_losses(self) -> torch.Tensor:
         # TODO: this function ought to just return a histogram or something
         sequence_losses = []
         for info in self.sequences:
@@ -326,29 +317,69 @@ class TrainHelper:
         return torch.stack(sequence_losses).sum() / len(sequence_losses) \
             / self.train_config.confidence_scale
 
-    def backward_all(self):
-        train_loss = self.sum_train_loss()
-        unweighted_loss_f = self.sum_unweighted_loss().item()
-        train_loss_f = train_loss.item()
-        train_loss.backward()
+class TrainHelper:
+    prev_unweighted_losses: list[float]
+    "List of previous unweighted losses for adjusting ponder_loss_penalty"
+    aim_run: aim.Run | None = None
+    "Aim run instance for run tracking"
+    batches: list[TrainBatch]
+    "List of all batches"
+    model: RNNSequence
+    tokenizer: SentencePieceProcessor
+    model_config: ModelConfig
+    train_config: TrainConfig
+    device: torch.device
+    dtype: torch.dtype
+    sequence_provider: SequenceProvider
 
-        grads_norm_f = nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.train_config.clip_grad_norm,
-            error_if_nonfinite=True,
-        ).item()
+    train_loss: float = 0.0
+    "Train loss for current step"
+    unweighted_loss: float = 0.0
+    "Unweighted loss for current step"
+    ponder_adjust_lookback: int
+    "How many values to keep for calculating mean/variance for confidence"
 
-        return train_loss_f, unweighted_loss_f, grads_norm_f
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        tokenizer: SentencePieceProcessor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        self.model_config = model_config
+        self.train_config = train_config
+        self.device = device
+        self.dtype = dtype
+        self.tokenizer = tokenizer
+        self.sequence_provider = None
+        self.prev_unweighted_losses = []
 
-    def adjust_confidence_stats(self):
-        self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses)
-        self.train_config.prev_loss_std = np.std(self.prev_unweighted_losses)
-        print(
-            'adjust_confidence_stats: mean',
-            self.train_config.prev_loss_mean,
-            'std',
-            self.train_config.prev_loss_std,
-        )
+        self.model = RNNSequence(model_config)
+        self.model.type(self.dtype)
+        self.model.to(self.device)
+        self.model.train()
+
+        self.batch_count = self.train_config.accumulate_gradients
+        self.batches = []
+
+        # 16 steps is a very arbitrary number
+        self.ponder_adjust_lookback = self.train_config.batch_size * \
+            self.train_config.accumulate_gradients * 16
+
+    def prepare(self):
+        for _ in range(self.batch_count):
+            batch = TrainBatch(
+                model=self.model,
+                model_config=self.model_config,
+                train_config=self.train_config,
+                tokenizer=self.tokenizer,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.train_config.batch_size,
+                sequence_provider=self.sequence_provider,
+            )
+            self.batches.append(batch)
 
     def track(
         self,
@@ -362,6 +393,53 @@ class TrainHelper:
         "Track stat with aim"
         if self.aim_run is not None:
             self.aim_run.track(value, name, step, epoch, context=context)
+
+    def step_all(self):
+        self.train_loss = 0
+        self.unweighted_loss = 0
+        print('batch: ', end='', flush=True)
+        for i, batch in enumerate(self.batches):
+            self.step_single(batch)
+            print(i, end=' ', flush=True)
+
+        print('done')
+        return self.train_loss, self.unweighted_loss
+
+    def step_single(self, batch: TrainBatch):
+        batch.next_batch()
+        # forward step
+        for _ in range(self.train_config.truncate_steps):
+            done_count = batch.forward_step()
+            if done_count >= batch.batch_size:
+                break
+
+        # run loss
+        seq_proportion = batch.batch_size * self.batch_count
+        train_losses = list(batch.iter_train_losses())
+        train_loss = torch.stack(train_losses).sum() / seq_proportion
+        self.train_loss += train_loss.item()
+
+        unweighted_losses = torch.stack(list(batch.iter_unweighted_losses()))
+        self.prev_unweighted_losses += unweighted_losses.tolist()
+        if len(self.prev_unweighted_losses) > self.ponder_adjust_lookback * 2:
+            self.prev_unweighted_losses = self.prev_unweighted_losses[self.ponder_adjust_lookback:]
+        self.unweighted_loss += (unweighted_losses.sum() / seq_proportion).item()
+
+        # backward step
+        train_loss.backward()
+
+    def adjust_confidence_stats(self):
+        self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses)
+        self.train_config.prev_loss_std = np.std(self.prev_unweighted_losses)
+        print(
+            'adjust_confidence_stats: mean',
+            self.train_config.prev_loss_mean,
+            'std',
+            self.train_config.prev_loss_std,
+        )
+
+def now_str():
+    return datetime.datetime.now().isoformat()
 
 def main():
     device = torch.device('cuda')
@@ -399,7 +477,9 @@ def main():
         train_config = TrainConfig.from_dict(loaded['train_config'])
         tokenizer = SentencePieceProcessor()
         tokenizer.Init(model_file=model_config.tokenizer_model_path)
-        trainer = TrainHelper(model_config, train_config, tokenizer, device, model_config.get_dtype())
+        trainer = TrainHelper(
+            model_config, train_config, tokenizer, device, model_config.get_dtype()
+        )
         print('loading model')
         trainer.model.load_state_dict(loaded['model_state'])
 
@@ -449,10 +529,6 @@ def main():
         print('loading optimizer state')
         optimizer.load_state_dict(load_optimizer_state)
 
-    batch = 0
-    done_count = train_config.batch_size
-    done_threshold = train_config.batch_size // 3 * 2
-
     checkpoint_now = False
     graceful_exit = False
     def handle_signal(signum, _frame):
@@ -480,55 +556,50 @@ def main():
 
         torch.save(state, save_to)
 
-    accumulate_steps = 0
-
+    trainer.prepare()
     while True:
         step += 1
         optimizer.zero_grad()
 
-        if done_count >= done_threshold or True:
-            batch += 1
-            trainer.next_batch()
+        # TODO: determine if truncated BPTT should be used, and if so, fix it
+        # if done_count >= done_threshold or True:
+        #     batch += 1
 
-        backprop_steps = 0
-        while backprop_steps < train_config.truncate_steps:
-            done_count = trainer.forward_step()
-            backprop_steps += 1
-
-        train_loss_f, unweighted_loss_f, grads_norm_f = trainer.backward_all()
-
-        print('\nstep:', step, 'batch:', batch)
-        print('grad norm:', grads_norm_f)
+        print('\nstep:', step)
+        train_loss_f, unweighted_loss_f = trainer.step_all()
         print('training loss:', train_loss_f)
         print('unweighted loss:', unweighted_loss_f)
         trainer.track(train_loss_f, name='train_loss', step=step)
         trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
-        trainer.track(grads_norm_f, name='grad_norm', step=step)
-        confidence_loss_f = trainer.sum_confidence_losses().item()
-        trainer.track(confidence_loss_f, name='confidence_loss', step=step)
+        # confidence_loss_f = trainer.sum_confidence_losses().item()
+        # trainer.track(confidence_loss_f, name='confidence_loss', step=step)
 
-        if grads_norm_f > 1e6:
-            print('\n\nerror: norm of gradients is too high, aborting:', grads_norm_f)
-            raise RuntimeError(f'grads_norm too high: {grads_norm_f}')
+        grad_norm_f = nn.utils.clip_grad_norm_(
+            model.parameters(),
+            train_config.clip_grad_norm,
+            error_if_nonfinite=True,
+        ).item()
 
-        # might not work? not sure
-        # it absolutely does not work
-        #trainer.truncate_backprop()
+        print('grad norm:', grad_norm_f)
+        trainer.track(grad_norm_f, name='grad_norm', step=step)
 
-        accumulate_steps += 1
-        if accumulate_steps >= train_config.accumulate_gradients:
-            print('stepping optimizer')
+        if grad_norm_f > 1e3:
+            print('!!! error: norm of gradients is too high:', grad_norm_f)
+            save_path = checkpoint_path + '.graderr.' + now_str()
+            save_checkpoint(save_path)
+            print('checkpoint saved to', save_path)
+            print('the current optimizer step will be skipped')
+        else:
             optimizer.step()
-            accumulate_steps = 0
 
-        if step % 10 == 0 and len(trainer.prev_unweighted_losses) >= PONDER_ADJUST_LOOKBACK:
+        if step % 10 == 0 and len(trainer.prev_unweighted_losses) >= trainer.ponder_adjust_lookback:
             trainer.adjust_confidence_stats()
             trainer.track(trainer.train_config.prev_loss_mean, name='prev_loss_mean', step=step)
             trainer.track(trainer.train_config.prev_loss_std, name='prev_loss_std', step=step)
 
         if step % 1000 == 0 or checkpoint_now:
             checkpoint_now = False
-            save_path = checkpoint_path + '.' + str(int(datetime.datetime.now().timestamp()))
+            save_path = checkpoint_path + '.' + now_str()
             save_checkpoint(save_path)
             print('checkpoint saved to', save_path)
 
