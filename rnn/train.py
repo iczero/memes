@@ -427,6 +427,8 @@ class TrainHelper:
 
         # backward step
         train_loss.backward()
+        # safe to reset if not TBPTT
+        # batch.reset()
 
     def adjust_confidence_stats(self):
         self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses)
@@ -437,9 +439,6 @@ class TrainHelper:
             'std',
             self.train_config.prev_loss_std,
         )
-
-def now_str():
-    return datetime.datetime.now().isoformat()
 
 def main():
     device = torch.device('cuda')
@@ -529,6 +528,10 @@ def main():
         print('loading optimizer state')
         optimizer.load_state_dict(load_optimizer_state)
 
+    def now_str():
+        return f's{step:06.0f}-{int(datetime.datetime.now().timestamp())}'
+
+    last_checkpoint = datetime.datetime.now()
     checkpoint_now = False
     graceful_exit = False
     def handle_signal(signum, _frame):
@@ -597,11 +600,12 @@ def main():
             trainer.track(trainer.train_config.prev_loss_mean, name='prev_loss_mean', step=step)
             trainer.track(trainer.train_config.prev_loss_std, name='prev_loss_std', step=step)
 
-        if step % 1000 == 0 or checkpoint_now:
+        if (datetime.datetime.now() - last_checkpoint).total_seconds() > 3600 or checkpoint_now:
             checkpoint_now = False
             save_path = checkpoint_path + '.' + now_str()
             save_checkpoint(save_path)
             print('checkpoint saved to', save_path)
+            last_checkpoint = datetime.datetime.now()
 
             if graceful_exit:
                 print('exiting gracefully...')

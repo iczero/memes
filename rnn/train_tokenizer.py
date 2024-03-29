@@ -46,7 +46,7 @@ def main():
                 if sentences % 100 == 0:
                     file_wrap.pbar.set_description(f'sentences: {sentences}', refresh=False)
 
-                if sentences >= 163840:
+                if sentences >= 262144:
                     file_wrap.pbar.set_description(
                         f'sentences: {sentences}, input loading done', refresh=True
                     )
@@ -56,7 +56,7 @@ def main():
         sentence_iterator=generate_sentences(),
         model_type='unigram',
         model_prefix=out_prefix,
-        vocab_size=8192,
+        vocab_size=16000,
         max_sentence_length=1048576,
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,

@@ -22,3 +22,5 @@
   - is it residual gating?
 - update the diagram
   - how long until the updated one ends up outdated again?
+- port to torch_xla or jax for TRC
+  - this stupid project is now sponsored by google
