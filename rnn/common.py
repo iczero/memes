@@ -114,6 +114,11 @@ class TrainConfig:
     "Running mean of loss, for use in confidence"
     prev_loss_std: float
     "Running standard deviation of loss, for use in confidence"
+    short_ctx_dropout_p: float
+    """
+    Probability to drop an input token from the short context
+    (excluding the last, which is never dropped)
+    """
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
@@ -130,6 +135,7 @@ class TrainConfig:
             prev_loss_mean=float(obj['prev_loss_mean']),
             prev_loss_std=float(obj['prev_loss_std']),
             accumulate_gradients=int(obj['accumulate_gradients']),
+            short_ctx_dropout_p=float(obj['short_ctx_dropout_p']),
         )
 
     def to_dict(self):

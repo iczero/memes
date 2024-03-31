@@ -91,6 +91,13 @@ class TrainBatch:
         self.batch_size = batch_size
         self.sequence_provider = sequence_provider
 
+        self.pad_token = torch.tensor(tokenizer['<pad>'], dtype=torch.int64, device=self.device)
+        self.shortctx_dropout_mask = torch.tensor(
+            [train_config.short_ctx_dropout_p] * (model_config.short_ctx_len - 1) + [0.],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
     def next_sequence(self) -> list[int]:
         if self.sequence_provider is None:
             raise RuntimeError('sequence_provider not provided')
@@ -117,6 +124,12 @@ class TrainBatch:
 
     @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
     def forward_input_batch(self, input_encode: torch.Tensor):
+        # replace some tokens in short ctx with <pad>, but never the last
+        input_encode = torch.where(
+            self.shortctx_dropout_mask.bernoulli() > 0,
+            self.pad_token,
+            input_encode,
+        )
         return self.model.input(input_encode)
 
     def prepare_internal_batch(self):

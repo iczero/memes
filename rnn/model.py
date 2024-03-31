@@ -146,7 +146,7 @@ class InputLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # ensure sequence is of correct length
-        assert x.shape[-1] == self.short_ctx_len
+        #assert x.shape[-1] == self.short_ctx_len
 
         embeddings = self.input_embedding(x)
         attn_out = self.attention(embeddings)

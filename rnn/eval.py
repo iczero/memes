@@ -248,7 +248,7 @@ def main():
             max_ponder=4,
             temperature=0.7,
             top_k=50,
-            top_p=0.7,
+            top_p=0.9,
         )
 
         print('\n============== full sequence:')
