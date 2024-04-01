@@ -104,13 +104,6 @@ class TrainBatch:
 
         return self.sequence_provider.next_sequence()
 
-    def reset(self):
-        "Free resources or something"
-        # i have no idea what i'm doing
-        self.recurrent = None
-        self.sequences.clear()
-        self.halted_sequences.clear()
-
     def next_batch(self):
         self.recurrent = self.model.recurrent_init \
             .unsqueeze(0).repeat_interleave(self.batch_size, 0)
@@ -218,16 +211,17 @@ class TrainBatch:
         weighted_losses = p_not_halt * p_halt_out.detach() * cross_entropy + confidence_losses
 
         # prepare next p_not_halt
-        p_not_halt_updated = p_not_halt * (1 - p_halt_out.detach())
+        # reset p_not_halt if halted, otherwise add current
+        p_not_halt_next = torch.where(did_halt, 1., p_not_halt * (1 - p_halt_out.detach()))
 
         return next_recurrent, next_internal, token_out, confidence_out, p_halt_out, \
-            did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_updated
+            did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_next
 
     def forward_step(self):
         internal, expected_tokens = self.prepare_internal_batch()
 
         next_recurrent, next_internal, _token_out, _confidence_out, _p_halt_out, did_halt, \
-            cross_entropy, confidence_losses, weighted_losses, p_not_halt_updated = \
+            cross_entropy, confidence_losses, weighted_losses, p_not_halt_next = \
             self.forward_ponder_batch(
                 self.recurrent,
                 internal,
@@ -257,6 +251,7 @@ class TrainBatch:
         #print('forward_step(): confidence', _confidence_out)
 
         self.recurrent = next_recurrent
+        self.p_not_halt = p_not_halt_next
         self.halted_sequences.clear()
         ended_count = 0
 
@@ -292,9 +287,6 @@ class TrainBatch:
                     self.halted_sequences.append(i)
             else:
                 info.prev_internal = next_internal[i]
-
-        # reset p_not_halt if halted, otherwise add current
-        self.p_not_halt = torch.where(did_halt, 1., p_not_halt_updated)
 
         return ended_count
 
