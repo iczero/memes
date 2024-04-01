@@ -6,3 +6,7 @@ disable=
   C0116, # missing-function-docstring
   W0702, # bare-except
   C0415, # import-outside-toplevel
+  W0212, # protected-access
+
+[FORMAT]
+max-line-length=120

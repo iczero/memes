@@ -19,7 +19,6 @@ from .model import RNNSequence
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
 
-@torch.jit.script
 def confidence_loss(
     loss: torch.Tensor, confidence_logit: torch.Tensor,
     prev_mean: torch.Tensor, prev_std: torch.Tensor,
@@ -39,8 +38,6 @@ def confidence_loss(
 class TrainSequence:
     sequence: list[int]
     "Token sequence"
-    p_not_halt: torch.Tensor
-    "Running probability that all previous ponder steps have not halted"
     offset: int = 0
     "Current offset into the seqeuence"
     ended: bool = False
@@ -70,6 +67,8 @@ class TrainBatch:
     "List of sequences by index which halted the last step"
     batch_size: int
     "Size of this batch"
+    p_not_halt: torch.Tensor
+    "Running probability that all previous ponder steps have not halted"
 
     def __init__(
         self,
@@ -97,6 +96,7 @@ class TrainBatch:
             dtype=torch.float32,
             device=self.device,
         )
+        self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
 
     def next_sequence(self) -> list[int]:
         if self.sequence_provider is None:
@@ -115,14 +115,12 @@ class TrainBatch:
         self.recurrent = self.model.recurrent_init \
             .unsqueeze(0).repeat_interleave(self.batch_size, 0)
         self.sequences = [
-            TrainSequence(
-                sequence=self.next_sequence(),
-                p_not_halt=torch.tensor(1., dtype=self.dtype, device=self.device),
-            ) for _ in range(self.batch_size)
+            TrainSequence(sequence=self.next_sequence()) for _ in range(self.batch_size)
         ]
+        self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
         self.halted_sequences = list(range(self.batch_size))
 
-    @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
+    @torch.compile(disable=DISABLE_TORCH_COMPILE)
     def forward_input_batch(self, input_encode: torch.Tensor):
         # replace some tokens in short ctx with <pad>, but never the last
         input_encode = torch.where(
@@ -149,12 +147,12 @@ class TrainBatch:
                 # prepare batch for input layer
                 short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
                 if info.offset > 4 and torch.bernoulli(
-                    torch.tensor(self.train_config.backspace_p)
+                    torch.tensor(self.train_config.backspace_p, device='cpu')
                 ).item() > 0:
                     short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
                     info.offset -= 1
                     info.was_backspace = True
-                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu')
+                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=True)
                 input_batch.append((i, short_ctx))
                 # will be substitued later
                 input_sequences.append(None)
@@ -164,7 +162,7 @@ class TrainBatch:
                 next_token = self.tokenizer['<del>']
             else:
                 next_token = info.sequence[info.offset + short_ctx_len]
-            next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu')
+            next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu', pin_memory=True)
             output_list.append(next_token)
 
             # print('\nprepare_internal_batch(): sequences dump')
@@ -179,7 +177,8 @@ class TrainBatch:
 
         if len(input_batch) > 0:
             # run input batch
-            input_encode = torch.stack([v[1] for v in input_batch], dim=0).to(self.device)
+            input_encode = torch.stack([v[1] for v in input_batch], dim=0).to(self.device, non_blocking=True)
+            torch._dynamo.mark_dynamic(input_encode, 0)
             input_encode = self.forward_input_batch(input_encode)
 
             for item, encoded in zip(input_batch, input_encode):
@@ -187,7 +186,7 @@ class TrainBatch:
                 input_sequences[item[0]] = encoded
 
         input_array = torch.stack(input_sequences, dim=0)
-        output_array = torch.stack(output_list, dim=0).to(self.device)
+        output_array = torch.stack(output_list, dim=0).to(self.device, non_blocking=True)
 
         return input_array, output_array
 
@@ -197,6 +196,9 @@ class TrainBatch:
         recurrent: torch.Tensor,
         internal: torch.Tensor,
         expected_tokens: torch.Tensor,
+        # this value should not change during training
+        min_p_halt: float,
+        p_not_halt: torch.Tensor,
         prev_loss_mean: torch.Tensor,
         prev_loss_std: torch.Tensor,
     ):
@@ -206,36 +208,50 @@ class TrainBatch:
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
         confidence_losses = self.train_config.confidence_scale * \
             confidence_loss(cross_entropy, confidence_out, prev_loss_mean, prev_loss_std)
-        p_halt_out = F.sigmoid(confidence_out + self.model_config.ponder_adjust)
+        p_halt_out = torch.max(
+            F.sigmoid(confidence_out + self.model_config.ponder_adjust),
+            torch.tensor(min_p_halt),
+        )
+        did_halt = p_halt_out.detach().bernoulli() > 0
 
-        return next_recurrent, next_internal, token_out, confidence_out, \
-            p_halt_out, cross_entropy, confidence_losses
+        # P(halt | not previously halted) * ponder step loss
+        weighted_losses = p_not_halt * p_halt_out.detach() * cross_entropy + confidence_losses
+
+        # prepare next p_not_halt
+        p_not_halt_updated = p_not_halt * (1 - p_halt_out.detach())
+
+        return next_recurrent, next_internal, token_out, confidence_out, p_halt_out, \
+            did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_updated
 
     def forward_step(self):
         internal, expected_tokens = self.prepare_internal_batch()
 
-        next_recurrent, next_internal, _token_out, _confidence_out, p_halt_out, \
-            cross_entropy, confidence_losses = \
+        next_recurrent, next_internal, _token_out, _confidence_out, _p_halt_out, did_halt, \
+            cross_entropy, confidence_losses, weighted_losses, p_not_halt_updated = \
             self.forward_ponder_batch(
                 self.recurrent,
                 internal,
                 expected_tokens,
-                prev_loss_mean=torch.tensor( # prevent torch.compile from recompiling on change
+                min_p_halt=self.train_config.min_p_halt,
+                p_not_halt=self.p_not_halt,
+                # prevent torch.compile from recompiling on change
+                prev_loss_mean=torch.tensor(
                     self.train_config.prev_loss_mean,
-                    device=self.device,
-                    dtype=self.dtype
-                ),
+                    device='cpu',
+                    dtype=self.dtype,
+                    pin_memory=True,
+                ).to(self.device, non_blocking=True),
                 prev_loss_std=torch.tensor(
                     self.train_config.prev_loss_std,
-                    device=self.device,
-                    dtype=self.dtype
-                ),
+                    device='cpu',
+                    dtype=self.dtype,
+                    pin_memory=True,
+                ).to(self.device, non_blocking=True),
             )
 
-        p_halt_out_detached = p_halt_out.detach()
-        p_halt_out_cpu = p_halt_out_detached.to('cpu', non_blocking=True)
-        confidence_losses_cpu = confidence_losses.detach().to('cpu', non_blocking=True)
         cross_entropy_cpu = cross_entropy.detach().to('cpu', non_blocking=True)
+        confidence_losses_cpu = confidence_losses.detach().to('cpu', non_blocking=True)
+        did_halt_cpu = did_halt.to('cpu', non_blocking=True)
 
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
@@ -243,26 +259,18 @@ class TrainBatch:
         self.recurrent = next_recurrent
         self.halted_sequences.clear()
         ended_count = 0
+
         for i, info in enumerate(self.sequences):
             if info.ended:
                 # skip finished sequences
                 ended_count += 1
                 continue
 
-            p_halt_detached_cpu: torch.Tensor = torch.max(
-                p_halt_out_cpu[i],
-                torch.tensor(self.train_config.min_p_halt, device='cpu'),
-            )
-            did_halt = p_halt_detached_cpu.bernoulli() > 0
-
-            # P(halt | not previously halted) * ponder step loss
-            weighted_loss = info.p_not_halt * p_halt_out_detached[i] * cross_entropy[i] + confidence_losses[i]
-            info.losses.append(weighted_loss)
+            info.losses.append(weighted_losses[i])
             info.confidence_losses.append(confidence_losses_cpu[i])
 
-            if did_halt:
+            if did_halt_cpu[i]:
                 info.prev_internal = None
-                info.p_not_halt.copy_(1., non_blocking=True)
                 # record unweighted loss as well
                 info.halted_losses.append(cross_entropy_cpu[i])
 
@@ -284,7 +292,9 @@ class TrainBatch:
                     self.halted_sequences.append(i)
             else:
                 info.prev_internal = next_internal[i]
-                info.p_not_halt *= 1 - p_halt_detached_cpu
+
+        # reset p_not_halt if halted, otherwise add current
+        self.p_not_halt = torch.where(did_halt, 1., p_not_halt_updated)
 
         return ended_count
 
