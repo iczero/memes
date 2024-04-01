@@ -57,12 +57,14 @@ def main():
         model_type='unigram',
         model_prefix=out_prefix,
         vocab_size=16000,
+        #vocab_size=32000,
         max_sentence_length=1048576,
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,
         normalization_rule_name='nfkc',
         byte_fallback=True,
         character_coverage=0.995,
+        #character_coverage=0.999,
         # force characters to exist, or character_coverage will disappear them
         required_chars=''.join([
             '0123456789',

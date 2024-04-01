@@ -1,3 +1,4 @@
+"Note: despite being named 'eval', this module does not actually evaluate"
 import sys
 
 import torch

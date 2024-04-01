@@ -141,21 +141,40 @@ class TrainConfig:
     def to_dict(self):
         return dataclasses.asdict(self)
 
-    def make_optimizer(self, parameters):
+    def make_param_groups(self, named_parameters):
+        exclude_wd = []
+        default = []
+        for name, param in named_parameters:
+            if len(param.shape) < 2 or name == 'recurrent_init':
+                exclude_wd.append(param)
+            else:
+                default.append(param)
+
+        return [
+            { 'params': exclude_wd, 'weight_decay': 0.0 },
+            { 'params': default },
+        ]
+
+    def make_optimizer(self, named_parameters, allow_fused=False):
+        groups = self.make_param_groups(named_parameters)
         if self.optimizer == 'AdamW':
             return torch.optim.AdamW(
-                parameters,
+                groups,
                 self.lr,
                 # test
                 betas=(0.8, 0.95),
                 weight_decay=self.weight_decay,
+                fused=allow_fused,
             )
-        elif self.optimizer == 'SGD':
+
+        if self.optimizer == 'SGD':
             return torch.optim.SGD(
-                parameters,
+                groups,
                 self.lr,
                 weight_decay=self.weight_decay,
             )
+
+        raise RuntimeError('unknown optimizer ' + self.optimizer)
 
 def random_token_not(total: int, not_token: int):
     "Generate a random token id that is not the provided token"

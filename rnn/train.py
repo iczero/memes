@@ -535,7 +535,10 @@ def main():
     )
 
     model = trainer.model
-    optimizer = train_config.make_optimizer(model.parameters())
+    optimizer = train_config.make_optimizer(
+        model.named_parameters(),
+        allow_fused=(device.type == 'cuda'),
+    )
 
     if load_optimizer_state is not None:
         print('loading optimizer state')

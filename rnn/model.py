@@ -178,7 +178,7 @@ class IntermediateLayer(nn.Module):
         return recurrent + recurrent_resid, internal + internal_resid
 
 class OutputDecode(nn.Module):
-    "Derive output token and ponder confidence from recurrent state"
+    "Derive output token and ponder confidence from internal state"
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.n_embed = config.n_embed
@@ -193,8 +193,8 @@ class OutputDecode(nn.Module):
             bias=config.qkv_bias,
         )
 
-        self.q_halt = nn.Parameter(torch.randn(config.n_embed))
-        self.kv_linear_halt = nn.Linear(
+        self.q_confidence = nn.Parameter(torch.randn(config.n_embed))
+        self.kv_linear_confidence = nn.Linear(
             config.n_embed,
             2 * config.n_embed,
             bias=config.qkv_bias,
@@ -218,14 +218,14 @@ class OutputDecode(nn.Module):
 
         q = torch.stack((
             self.q_out.unsqueeze(0),
-            self.q_halt.unsqueeze(0),
+            self.q_confidence.unsqueeze(0),
         ), dim=0)
         # TODO: removed a q = q.unsqueeze(0) at the end, was it needed? (batch)
         # -> (out/halt, "seq", n_embed)
 
         kv_merged = torch.stack((
             self.kv_linear_out(internal).unflatten(-1, (2, self.n_embed)),
-            self.kv_linear_halt(internal).unflatten(-1, (2, self.n_embed)),
+            self.kv_linear_confidence(internal).unflatten(-1, (2, self.n_embed)),
         ), dim=-4)
         # kv_merged: (batch, out/halt, seq, k/v, n_embed)
         # extract k/v for sdp
