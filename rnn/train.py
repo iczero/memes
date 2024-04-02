@@ -423,6 +423,7 @@ class TrainHelper:
 
     def step_single(self, batch: TrainBatch):
         batch.next_batch()
+
         # forward step
         for _ in range(self.train_config.truncate_steps):
             done_count = batch.forward_step()
