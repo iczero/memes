@@ -112,16 +112,16 @@ class GatedFeedForward(nn.Module):
             nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(in_len, mid_len),
             config.get_activation(),
+            nn.Dropout(config.ff_dropout_p),
             nn.Linear(mid_len, out_len),
         )
-        self.dropout = nn.Dropout(config.ff_dropout_p)
 
     def forward(self, x):
         out = self.stack(x)
         # extract resid gate
         resid_gate = F.sigmoid(out[..., -1]) * self.resid_gate_multiplier
-        # calculate residual, apply dropout
-        resid = self.dropout(out[..., :-1])
+        # calculate residual
+        resid = out[..., :-1]
         # gate residual and return
         return resid * resid_gate.unsqueeze(-1)
 
@@ -145,8 +145,8 @@ class InputLayer(nn.Module):
             nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(ff_in_dim, ff_mid_dim),
             config.get_activation(),
-            nn.Linear(ff_mid_dim, config.n_embed),
             nn.Dropout(config.ff_dropout_p),
+            nn.Linear(ff_mid_dim, config.n_embed),
         )
 
     def forward(self, x: torch.Tensor):
