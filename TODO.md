@@ -18,9 +18,10 @@
   - (done?) extract "high quality" sources from the pile or some other dataset
   - (DONE) retrain tokenizer on that dataset
   - (DONE) definitely attempt to exclude code or Advanced Biology™ from the set
-- (DONE) figure out why reduced precision (bf16) doesn't converge
+- figure out why reduced precision (bf16) doesn't converge
   - is it residual gating?
   - it works now? no idea why it didn't work before
+    - [EXTREMELY LOUD INCORRECT BUZZER]
 - update the diagram
   - how long until the updated one ends up outdated again?
 - port to torch_xla or jax for TRC
