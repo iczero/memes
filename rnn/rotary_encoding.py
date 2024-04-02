@@ -26,7 +26,7 @@ class RotaryEncoding(nn.Module):
     def forward(self, x):
         return rotary_encoding_forward(self.cos_cached, self.sin_cached, x)
 
-@torch.jit.script
+#@torch.jit.script
 def rotary_encoding_forward(cos_cached: torch.Tensor, sin_cached: torch.Tensor, x: torch.Tensor):
     # [[ cos(m*t), -sin(m*t) ],  @  [[a],
     #  [ sin(m*t),  cos(m*t) ]]      [b]]

@@ -113,7 +113,7 @@ class TrainBatch:
         self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
         self.halted_sequences = list(range(self.batch_size))
 
-    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
     def forward_input_batch(self, input_encode: torch.Tensor):
         # replace some tokens in short ctx with <pad>, but never the last
         input_encode = torch.where(
@@ -171,7 +171,8 @@ class TrainBatch:
         if len(input_batch) > 0:
             # run input batch
             input_encode = torch.stack([v[1] for v in input_batch], dim=0).to(self.device, non_blocking=True)
-            torch._dynamo.mark_dynamic(input_encode, 0)
+            # unfortunately, it does not, well, work
+            #torch._dynamo.mark_dynamic(input_encode, 0)
             input_encode = self.forward_input_batch(input_encode)
 
             for item, encoded in zip(input_batch, input_encode):
