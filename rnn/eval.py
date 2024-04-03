@@ -53,7 +53,7 @@ class InferenceHelper:
     def initialize(self):
         self.offset = 0
         self.sequence = [self.tokenizer['<pad>']] * self.config.short_ctx_len
-        self.recurrent = self.model.recurrent_init.clone()
+        self.recurrent = self.model.make_recurrent_init()
 
     @property
     def offset_end(self):

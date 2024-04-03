@@ -105,7 +105,7 @@ class TrainBatch:
         return self.sequence_provider.next_sequence()
 
     def next_batch(self):
-        self.recurrent = self.model.recurrent_init \
+        self.recurrent = self.model.make_recurrent_init() \
             .unsqueeze(0).repeat_interleave(self.batch_size, 0)
         self.sequences = [
             TrainSequence(sequence=self.next_sequence()) for _ in range(self.batch_size)

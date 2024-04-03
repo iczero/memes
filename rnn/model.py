@@ -281,9 +281,16 @@ class RNNPonder(nn.Module):
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.recurrent_init = nn.Parameter(torch.randn((config.recurrent_seq_len, config.n_embed)))
+        self.recurrent_seq_len = config.recurrent_seq_len
+        self.recurrent_init = nn.Parameter(torch.randn(config.n_embed))
+        self.recurrent_init_rope = RotaryEncoding(config.n_embed, config.recurrent_seq_len)
         self.input = InputLayer(config)
         self.ponder = RNNPonder(config)
+
+    def make_recurrent_init(self):
+        recurrent_init = self.recurrent_init.unsqueeze(0) \
+            .repeat_interleave(self.recurrent_seq_len, 0)
+        return self.recurrent_init_rope(recurrent_init)
 
     def forward(self):
         # this module probably needs more than just forward()
