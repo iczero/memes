@@ -6,9 +6,6 @@ from .common import ModelConfig
 from .rotary_encoding import RotaryEncoding
 
 
-# TODO: config?
-FF_DIM_MUL = 4
-
 class PartialCrossAttention(nn.Module):
     "Partial cross attention layer"
 
@@ -102,7 +99,7 @@ class GatedFeedForward(nn.Module):
         super().__init__()
         self.register_buffer('resid_gate_multiplier', torch.tensor(config.resid_gate_multiplier))
         in_len = config.n_embed * config.n_attention_heads
-        mid_len = FF_DIM_MUL * config.n_embed
+        mid_len = config.ff_dim_multiplier * config.n_embed
         out_len = config.n_embed + 1
         # in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
         # out: residuals (batch, seq, n_embed) after gating
@@ -111,6 +108,8 @@ class GatedFeedForward(nn.Module):
             # concat all heads
             nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(in_len, mid_len),
+            config.get_activation(),
+            nn.Linear(mid_len, mid_len),
             config.get_activation(),
             nn.Dropout(config.ff_dropout_p),
             nn.Linear(mid_len, out_len),
@@ -139,11 +138,13 @@ class InputLayer(nn.Module):
         # no residuals in input layer
         # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
         ff_in_dim = config.n_embed * config.n_attention_heads
-        ff_mid_dim = FF_DIM_MUL * config.n_embed
+        ff_mid_dim = config.ff_dim_multiplier * config.n_embed
         self.feedforward = nn.Sequential(
             # concat heads
             nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(ff_in_dim, ff_mid_dim),
+            config.get_activation(),
+            nn.Linear(ff_mid_dim, ff_mid_dim),
             config.get_activation(),
             nn.Dropout(config.ff_dropout_p),
             nn.Linear(ff_mid_dim, config.n_embed),
@@ -206,16 +207,16 @@ class OutputDecode(nn.Module):
         )
 
         self.ff_out = nn.Sequential(
-            nn.Linear(config.n_embed, FF_DIM_MUL * config.n_embed),
+            nn.Linear(config.n_embed, config.ff_dim_multiplier * config.n_embed),
             config.get_activation(),
-            nn.Linear(FF_DIM_MUL * config.n_embed, config.n_embed),
+            nn.Linear(config.ff_dim_multiplier * config.n_embed, config.n_embed),
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
         self.ff_confidence = nn.Sequential(
-            nn.Linear(config.n_embed, FF_DIM_MUL * config.n_embed),
+            nn.Linear(config.n_embed, config.n_embed),
             config.get_activation(),
-            nn.Linear(FF_DIM_MUL * config.n_embed, 1), # confidence
+            nn.Linear(config.n_embed, 1), # confidence
         )
 
     def forward(self, internal: torch.Tensor):
@@ -226,7 +227,6 @@ class OutputDecode(nn.Module):
             self.q_out.unsqueeze(0),
             self.q_confidence.unsqueeze(0),
         ), dim=0)
-        # TODO: removed a q = q.unsqueeze(0) at the end, was it needed? (batch)
         # -> (out/halt, "seq", n_embed)
 
         kv_merged = torch.stack((
