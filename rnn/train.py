@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch._dynamo.config
 import torch.nn.functional as F
+import torch_xla
+import torch_xla.core.xla_model as xm
 from sentencepiece import SentencePieceProcessor
 from torch import nn
 
@@ -16,8 +18,24 @@ from .common import ModelConfig, TrainConfig, random_token_not
 from .data import SequenceProvider, load_dataset
 from .model import RNNSequence
 
+
+import traceback
+import warnings
+import sys
+
+def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+
+    log = file if hasattr(file,'write') else sys.stderr
+    traceback.print_stack(file=log)
+    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+
+warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('always')
+
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
+USE_PINNED_MEMORY = False
+torch._dynamo.config.cache_size_limit = 128
 
 def confidence_loss(
     loss: torch.Tensor, confidence_logit: torch.Tensor,
@@ -113,7 +131,7 @@ class TrainBatch:
         self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
         self.halted_sequences = list(range(self.batch_size))
 
-    @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
+    @torch.compile(disable=DISABLE_TORCH_COMPILE, backend='openxla')
     def forward_input_batch(self, input_encode: torch.Tensor):
         # replace some tokens in short ctx with <pad>, but never the last
         input_encode = torch.where(
@@ -145,7 +163,7 @@ class TrainBatch:
                     short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
                     info.offset -= 1
                     info.was_backspace = True
-                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=True)
+                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=USE_PINNED_MEMORY)
                 input_batch.append((i, short_ctx))
                 # will be substitued later
                 input_sequences.append(None)
@@ -155,7 +173,7 @@ class TrainBatch:
                 next_token = self.tokenizer['<del>']
             else:
                 next_token = info.sequence[info.offset + short_ctx_len]
-            next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu', pin_memory=True)
+            next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu', pin_memory=USE_PINNED_MEMORY)
             output_list.append(next_token)
 
             # print('\nprepare_internal_batch(): sequences dump')
@@ -173,18 +191,20 @@ class TrainBatch:
             input_encode = torch.stack([v[1] for v in input_batch], dim=0).to(self.device, non_blocking=True)
             # unfortunately, it does not, well, work
             #torch._dynamo.mark_dynamic(input_encode, 0)
-            input_encode = self.forward_input_batch(input_encode)
+            input_encode = self.forward_input_batch(input_encode).to('cpu', non_blocking=True)
 
             for item, encoded in zip(input_batch, input_encode):
                 # input_encode first dimension is batch
                 input_sequences[item[0]] = encoded
 
-        input_array = torch.stack(input_sequences, dim=0)
+        input_array = torch.stack(input_sequences, dim=0).to(self.device, non_blocking=True)
         output_array = torch.stack(output_list, dim=0).to(self.device, non_blocking=True)
+
+        #input_array.register_hook(lambda _grad: xm.mark_step())
 
         return input_array, output_array
 
-    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    @torch.compile(disable=DISABLE_TORCH_COMPILE, backend='openxla')
     def forward_ponder_batch(
         self,
         recurrent: torch.Tensor,
@@ -234,23 +254,27 @@ class TrainBatch:
                     self.train_config.prev_loss_mean,
                     device='cpu',
                     dtype=self.dtype,
-                    pin_memory=True,
+                    pin_memory=USE_PINNED_MEMORY,
                 ).to(self.device, non_blocking=True),
                 prev_loss_std=torch.tensor(
                     self.train_config.prev_loss_std,
                     device='cpu',
                     dtype=self.dtype,
-                    pin_memory=True,
+                    pin_memory=USE_PINNED_MEMORY,
                 ).to(self.device, non_blocking=True),
             )
 
         cross_entropy_cpu = cross_entropy.detach().to('cpu', non_blocking=True)
         confidence_losses_cpu = confidence_losses.detach().to('cpu', non_blocking=True)
         did_halt_cpu = did_halt.to('cpu', non_blocking=True)
+        next_internal_cpu = next_internal.to('cpu', non_blocking=True)
+        weighted_losses_cpu = weighted_losses.to('cpu', non_blocking=True)
 
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
 
+        # memes?
+        #next_recurrent.register_hook(lambda _grad: xm.mark_step())
         self.recurrent = next_recurrent
         self.p_not_halt = p_not_halt_next
         self.halted_sequences.clear()
@@ -262,7 +286,7 @@ class TrainBatch:
                 ended_count += 1
                 continue
 
-            info.losses.append(weighted_losses[i])
+            info.losses.append(weighted_losses_cpu[i])
             info.confidence_losses.append(confidence_losses_cpu[i])
 
             if did_halt_cpu[i]:
@@ -278,7 +302,7 @@ class TrainBatch:
                     info.prev_internal = torch.zeros((
                         self.model_config.short_ctx_len,
                         self.model_config.n_embed,
-                    ), device=self.device, dtype=self.dtype)
+                    ), device='cpu', dtype=self.dtype)
                 else:
                     # slide shortctx to include next token
                     if not info.was_backspace:
@@ -287,7 +311,7 @@ class TrainBatch:
                         info.was_backspace = False
                     self.halted_sequences.append(i)
             else:
-                info.prev_internal = next_internal[i]
+                info.prev_internal = next_internal_cpu[i]
 
         return ended_count
 
@@ -425,10 +449,13 @@ class TrainHelper:
         batch.next_batch()
 
         # forward step
-        for _ in range(self.train_config.truncate_steps):
+        print('forward: ', end='', flush=True)
+        for i in range(self.train_config.truncate_steps):
+            print(i, end=' ', flush=True)
             done_count = batch.forward_step()
             if done_count >= batch.batch_size:
                 break
+        print('done', end=' ', flush=True)
 
         # run loss
         seq_proportion = batch.batch_size * self.batch_count
@@ -442,8 +469,13 @@ class TrainHelper:
             self.prev_unweighted_losses = self.prev_unweighted_losses[self.ponder_adjust_lookback:]
         self.unweighted_loss += (unweighted_losses.sum() / seq_proportion).item()
 
+        xm.mark_step()
+
         # backward step
         train_loss.backward()
+
+        xm.mark_step()
+
         # safe to reset if not TBPTT
         # batch.reset()
 
@@ -458,8 +490,9 @@ class TrainHelper:
         )
 
 def main():
-    device = torch.device('cuda')
-    torch.set_float32_matmul_precision('high')
+    #device = torch.device('cuda')
+    #torch.set_float32_matmul_precision('high')
+    device = xm.xla_device()
 
     subcommand = sys.argv[1]
     # optimizer state to load, if any
@@ -605,6 +638,8 @@ def main():
 
         print('grad norm:', grad_norm_f)
         trainer.track(grad_norm_f, name='grad_norm', step=step)
+
+        xm.mark_step()
 
         if grad_norm_f > 1e3:
             print('!!! error: norm of gradients is too high:', grad_norm_f)
