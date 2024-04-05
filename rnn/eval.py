@@ -232,7 +232,7 @@ class InferenceHelper:
 def main():
     checkpoint_file = sys.argv[1]
     device = torch.device('cpu')
-    loaded = torch.load(checkpoint_file, map_location=device)
+    loaded = torch.load(checkpoint_file, map_location='cpu', weights_only=True)
     config = ModelConfig.from_dict(loaded['model_config'])
     model = RNNSequence(config)
     model.load_state_dict(loaded['model_state'])

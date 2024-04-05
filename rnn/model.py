@@ -98,21 +98,21 @@ class GatedFeedForward(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.register_buffer('resid_gate_multiplier', torch.tensor(config.resid_gate_multiplier))
-        in_len = config.n_embed * config.n_attention_heads
-        mid_len = config.ff_dim_multiplier * config.n_embed
-        out_len = config.n_embed + 1
+        in_dim = config.n_embed * config.n_attention_heads
+        mid_dim = config.ff_dim_multiplier * config.n_embed
+        out_dim = config.n_embed + 1
         # in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
         # out: residuals (batch, seq, n_embed) after gating
         # modified feedforward: dense after heads, then rescale back to n_embed
         self.stack = nn.Sequential(
             # concat all heads
             nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(in_len, mid_len),
+            nn.Linear(in_dim, mid_dim),
             config.get_activation(),
-            nn.Linear(mid_len, mid_len),
+            nn.Linear(mid_dim, mid_dim),
             config.get_activation(),
             nn.Dropout(config.ff_dropout_p),
-            nn.Linear(mid_len, out_len),
+            nn.Linear(mid_dim, out_dim),
         )
 
     def forward(self, x):
