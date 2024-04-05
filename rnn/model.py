@@ -117,7 +117,6 @@ class GatedFeedForward(nn.Module):
             config.get_activation(),
             nn.Linear(mid_dim, mid_dim),
             config.get_activation(),
-            nn.LayerNorm((mid_dim,)),
             nn.Dropout(config.ff_dropout_p),
             nn.Linear(mid_dim, out_dim),
         )
