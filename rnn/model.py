@@ -28,7 +28,7 @@ class PartialCrossAttention(nn.Module):
         )
         # https://arxiv.org/pdf/2110.09456.pdf
         # TODO: go make references section
-        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads,)))
+        self.head_scales = nn.Parameter(torch.zeros((config.n_attention_heads,)))
 
     def forward(self, internal: torch.Tensor, external: torch.Tensor):
         # external is the other sequence concatenated to k/v, internal is our own sequence
@@ -52,7 +52,7 @@ class PartialCrossAttention(nn.Module):
         attn_out = attn_out.transpose(-2, -3)
 
         # scale heads
-        return self.head_scales.unsqueeze(-1) * attn_out
+        return (1 + self.head_scales).unsqueeze(-1) * attn_out
 
 class SelfAttention(nn.Module):
     "Self attention layer with positional encoding"
