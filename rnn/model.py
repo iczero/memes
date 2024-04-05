@@ -26,6 +26,9 @@ class PartialCrossAttention(nn.Module):
             2 * config.n_attention_heads * config.n_embed,
             bias=config.qkv_bias,
         )
+        # https://arxiv.org/pdf/2110.09456.pdf
+        # TODO: go make references section
+        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads, 1)))
 
     def forward(self, internal: torch.Tensor, external: torch.Tensor):
         # external is the other sequence concatenated to k/v, internal is our own sequence
@@ -46,7 +49,10 @@ class PartialCrossAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
 
         # transpose back
-        return attn_out.transpose(-2, -3)
+        attn_out = attn_out.transpose(-2, -3)
+
+        # scale heads
+        return self.head_scales * attn_out
 
 class SelfAttention(nn.Module):
     "Self attention layer with positional encoding"
@@ -111,6 +117,7 @@ class GatedFeedForward(nn.Module):
             config.get_activation(),
             nn.Linear(mid_dim, mid_dim),
             config.get_activation(),
+            nn.LayerNorm((mid_dim,)),
             nn.Dropout(config.ff_dropout_p),
             nn.Linear(mid_dim, out_dim),
         )
