@@ -52,7 +52,7 @@ class PartialCrossAttention(nn.Module):
         attn_out = attn_out.transpose(-2, -3)
 
         # scale heads
-        return (1 + self.head_scales).unsqueeze(-1) * attn_out
+        return attn_out + self.head_scales.unsqueeze(-1) * attn_out
 
 class SelfAttention(nn.Module):
     "Self attention layer with positional encoding"
