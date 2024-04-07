@@ -4,9 +4,10 @@
     "n_attention_heads": 6,
     "vocab_size": 8192,
     "short_ctx_len": 8,
-    "internal_seq_len": 16,
+    "recurrent_seq_len": 8,
     "ff_dropout_p": 0.0,
     "attn_dropout_p": 0.0,
+    "ff_dim_multiplier": 4,
     "n_intermediate": 4,
     "resid_gate_multiplier": 2.0,
     "activation": "gelu",
@@ -19,14 +20,15 @@
     "lr": 1e-4,
     "weight_decay": 0.01,
     "backspace_p": 0.03,
-    "batch_size": 32,
+    "batch_size": 24,
     "truncate_steps": 100,
-    "accumulate_gradients": 1,
+    "accumulate_gradients": 2,
     "clip_grad_norm": 3.0,
     "min_p_halt": 0.35,
     "optimizer": "AdamW",
     "confidence_scale": 0.025,
     "prev_loss_mean": 8.0,
-    "prev_loss_std": 1.0
+    "prev_loss_std": 1.0,
+    "short_ctx_dropout_p": 0.05
   }
 }

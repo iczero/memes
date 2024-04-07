@@ -23,7 +23,7 @@ DISABLE_TORCH_COMPILE = False
 DEBUG_RECURRENT_GRAD: list[torch.Tensor] | None = None
 def signal_grad_debug(*_args):
     global DEBUG_RECURRENT_GRAD
-    DEBUG_RECURRENT_GRAD = []
+    DEBUG_RECURRENT_GRAD = True
 signal.signal(signal.SIGUSR1, signal_grad_debug)
 
 def confidence_loss(
@@ -258,7 +258,7 @@ class TrainBatch:
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
 
-        if DEBUG_RECURRENT_GRAD is not None:
+        if isinstance(DEBUG_RECURRENT_GRAD, list):
             next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad))
 
         self.recurrent = next_recurrent
@@ -459,7 +459,7 @@ class TrainHelper:
         # batch.truncate_backprop()
 
         global DEBUG_RECURRENT_GRAD
-        if DEBUG_RECURRENT_GRAD is not None and len(DEBUG_RECURRENT_GRAD) >= self.train_config.truncate_steps - 1:
+        if isinstance(DEBUG_RECURRENT_GRAD, list):
             import matplotlib.pyplot as plt
             DEBUG_RECURRENT_GRAD.reverse()
             x = []
@@ -472,9 +472,12 @@ class TrainHelper:
                 # pylint: disable-next=not-callable
                 y.append(torch.linalg.norm(grad, dim=-1).mean())
 
+            print(y)
             plt.plot(x, y)
             plt.show(block=True)
             DEBUG_RECURRENT_GRAD = None
+        elif DEBUG_RECURRENT_GRAD is True:
+            DEBUG_RECURRENT_GRAD = []
 
     def adjust_confidence_stats(self):
         self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses).item()
@@ -579,6 +582,7 @@ def main():
     if load_optimizer_state is not None:
         print('loading optimizer state')
         optimizer.load_state_dict(load_optimizer_state)
+        load_optimizer_state = None
 
     def now_str():
         return f's{step:06.0f}-{int(datetime.datetime.now().timestamp())}'
