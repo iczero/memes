@@ -17,10 +17,7 @@ class ModelConfig:
     "Vocabulary size"
     short_ctx_len: int
     "Length of input short context sequence"
-    internal_seq_len: int
-    # TODO: "internal_seq_len" is a terrible name and is literally not even consistent
-    "Length of internal sequence (total, short_ctx + recurrent)"
-    recurrent_seq_len: int = dataclasses.field(init=False)
+    recurrent_seq_len: int
     "Length of recurrent sequence"
     ff_dropout_p: float
     "Probability of dropout after feedforward"
@@ -30,6 +27,8 @@ class ModelConfig:
     "Number of intermediate layers"
     resid_gate_multiplier: float
     "Multiplier for residual gating"
+    ff_dim_multiplier: int
+    "Size of feedforward inner dimensions, as ff_dim_multiplier * n_embed"
     activation: str
     "Activation function"
     dtype: str
@@ -46,9 +45,7 @@ class ModelConfig:
         assert self.n_attention_heads > 0
         assert self.vocab_size > 0
         assert self.short_ctx_len > 0
-        assert self.internal_seq_len > 0
-        assert self.internal_seq_len > self.short_ctx_len
-        self.recurrent_seq_len = self.internal_seq_len - self.short_ctx_len
+        assert self.recurrent_seq_len > 0
         assert self.ff_dropout_p >= 0
         assert self.resid_gate_multiplier > 0
 
@@ -59,11 +56,12 @@ class ModelConfig:
             n_attention_heads=int(obj['n_attention_heads']),
             vocab_size=int(obj['vocab_size']),
             short_ctx_len=int(obj['short_ctx_len']),
-            internal_seq_len=int(obj['internal_seq_len']),
+            recurrent_seq_len=int(obj['recurrent_seq_len']),
             ff_dropout_p=float(obj['ff_dropout_p']),
             attn_dropout_p=float(obj['attn_dropout_p']),
             n_intermediate=int(obj['n_intermediate']),
             resid_gate_multiplier=float(obj['resid_gate_multiplier']),
+            ff_dim_multiplier=int(obj['ff_dim_multiplier']),
             activation=str(obj['activation']),
             dtype=str(obj['dtype']),
             qkv_bias=bool(obj['qkv_bias']),

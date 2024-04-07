@@ -19,6 +19,13 @@ from .model import RNNSequence
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
 
+# extreme hack
+DEBUG_RECURRENT_GRAD: list[torch.Tensor] | None = None
+def signal_grad_debug(*_args):
+    global DEBUG_RECURRENT_GRAD
+    DEBUG_RECURRENT_GRAD = True
+signal.signal(signal.SIGUSR1, signal_grad_debug)
+
 def confidence_loss(
     loss: torch.Tensor, confidence_logit: torch.Tensor,
     prev_mean: torch.Tensor, prev_std: torch.Tensor,
@@ -105,7 +112,7 @@ class TrainBatch:
         return self.sequence_provider.next_sequence()
 
     def next_batch(self):
-        self.recurrent = self.model.recurrent_init \
+        self.recurrent = self.model.make_recurrent_init() \
             .unsqueeze(0).repeat_interleave(self.batch_size, 0)
         self.sequences = [
             TrainSequence(sequence=self.next_sequence()) for _ in range(self.batch_size)
@@ -250,6 +257,9 @@ class TrainBatch:
 
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
+
+        if isinstance(DEBUG_RECURRENT_GRAD, list):
+            next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad))
 
         self.recurrent = next_recurrent
         self.p_not_halt = p_not_halt_next
@@ -446,10 +456,32 @@ class TrainHelper:
         train_loss.backward()
         # safe to reset if not TBPTT
         # batch.reset()
+        # batch.truncate_backprop()
+
+        global DEBUG_RECURRENT_GRAD
+        if isinstance(DEBUG_RECURRENT_GRAD, list):
+            import matplotlib.pyplot as plt
+            DEBUG_RECURRENT_GRAD.reverse()
+            x = []
+            y = []
+            for i, grad in enumerate(DEBUG_RECURRENT_GRAD):
+                if grad is None:
+                    continue
+                grad = grad.cpu()
+                x.append(i)
+                # pylint: disable-next=not-callable
+                y.append(torch.linalg.norm(grad, dim=-1).mean())
+
+            print(y)
+            plt.plot(x, y)
+            plt.show(block=True)
+            DEBUG_RECURRENT_GRAD = None
+        elif DEBUG_RECURRENT_GRAD is True:
+            DEBUG_RECURRENT_GRAD = []
 
     def adjust_confidence_stats(self):
-        self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses)
-        self.train_config.prev_loss_std = np.std(self.prev_unweighted_losses)
+        self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses).item()
+        self.train_config.prev_loss_std = np.std(self.prev_unweighted_losses).item()
         print(
             'adjust_confidence_stats: mean',
             self.train_config.prev_loss_mean,
@@ -488,7 +520,7 @@ def main():
         checkpoint_path = sys.argv[2]
         data_path = sys.argv[3]
 
-        loaded = torch.load(checkpoint_path)
+        loaded = torch.load(checkpoint_path, map_location='cpu')
         model_config = ModelConfig.from_dict(loaded['model_config'])
         train_config = TrainConfig.from_dict(loaded['train_config'])
         tokenizer = SentencePieceProcessor()
@@ -511,6 +543,9 @@ def main():
 
         if 'last_step' in loaded:
             step = loaded['last_step']
+
+        # no need to keep this around
+        del loaded
 
     else:
         print('unknown subcommand:', subcommand)
@@ -547,6 +582,7 @@ def main():
     if load_optimizer_state is not None:
         print('loading optimizer state')
         optimizer.load_state_dict(load_optimizer_state)
+        load_optimizer_state = None
 
     def now_str():
         return f's{step:06.0f}-{int(datetime.datetime.now().timestamp())}'

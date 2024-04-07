@@ -26,6 +26,9 @@ class PartialCrossAttention(nn.Module):
             2 * config.n_attention_heads * config.n_embed,
             bias=config.qkv_bias,
         )
+        # https://arxiv.org/pdf/2110.09456.pdf
+        # TODO: go make references section
+        self.head_scales = nn.Parameter(torch.zeros((config.n_attention_heads,)))
 
     def forward(self, internal: torch.Tensor, external: torch.Tensor):
         # external is the other sequence concatenated to k/v, internal is our own sequence
@@ -46,7 +49,10 @@ class PartialCrossAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
 
         # transpose back
-        return attn_out.transpose(-2, -3)
+        attn_out = attn_out.transpose(-2, -3)
+
+        # scale heads
+        return attn_out + self.head_scales.unsqueeze(-1) * attn_out
 
 class SelfAttention(nn.Module):
     "Self attention layer with positional encoding"
@@ -98,26 +104,29 @@ class GatedFeedForward(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.register_buffer('resid_gate_multiplier', torch.tensor(config.resid_gate_multiplier))
-        in_len = config.n_embed * config.n_attention_heads
-        out_len = config.n_embed + 1
+        in_dim = config.n_embed * config.n_attention_heads
+        mid_dim = config.ff_dim_multiplier * config.n_embed
+        out_dim = config.n_embed + 1
         # in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
         # out: residuals (batch, seq, n_embed) after gating
         # modified feedforward: dense after heads, then rescale back to n_embed
         self.stack = nn.Sequential(
             # concat all heads
             nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(in_len, in_len),
+            nn.Linear(in_dim, mid_dim),
             config.get_activation(),
-            nn.Linear(in_len, out_len),
+            nn.Linear(mid_dim, mid_dim),
+            config.get_activation(),
+            nn.Dropout(config.ff_dropout_p),
+            nn.Linear(mid_dim, out_dim),
         )
-        self.dropout = nn.Dropout(config.ff_dropout_p)
 
     def forward(self, x):
         out = self.stack(x)
         # extract resid gate
         resid_gate = F.sigmoid(out[..., -1]) * self.resid_gate_multiplier
-        # calculate residual, apply dropout
-        resid = self.dropout(out[..., :-1])
+        # calculate residual
+        resid = out[..., :-1]
         # gate residual and return
         return resid * resid_gate.unsqueeze(-1)
 
@@ -135,13 +144,16 @@ class InputLayer(nn.Module):
         # no residuals in input layer
         # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
         ff_in_dim = config.n_embed * config.n_attention_heads
+        ff_mid_dim = config.ff_dim_multiplier * config.n_embed
         self.feedforward = nn.Sequential(
             # concat heads
             nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(ff_in_dim, ff_in_dim),
+            nn.Linear(ff_in_dim, ff_mid_dim),
             config.get_activation(),
-            nn.Linear(ff_in_dim, config.n_embed),
+            nn.Linear(ff_mid_dim, ff_mid_dim),
+            config.get_activation(),
             nn.Dropout(config.ff_dropout_p),
+            nn.Linear(ff_mid_dim, config.n_embed),
         )
 
     def forward(self, x: torch.Tensor):
@@ -201,8 +213,9 @@ class OutputDecode(nn.Module):
         )
 
         self.ff_out = nn.Sequential(
-            nn.Linear(config.n_embed, config.n_embed),
+            nn.Linear(config.n_embed, config.ff_dim_multiplier * config.n_embed),
             config.get_activation(),
+            nn.Linear(config.ff_dim_multiplier * config.n_embed, config.n_embed),
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
@@ -220,7 +233,6 @@ class OutputDecode(nn.Module):
             self.q_out.unsqueeze(0),
             self.q_confidence.unsqueeze(0),
         ), dim=0)
-        # TODO: removed a q = q.unsqueeze(0) at the end, was it needed? (batch)
         # -> (out/halt, "seq", n_embed)
 
         kv_merged = torch.stack((
@@ -275,9 +287,16 @@ class RNNPonder(nn.Module):
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.recurrent_init = nn.Parameter(torch.randn((config.recurrent_seq_len, config.n_embed)))
+        self.recurrent_seq_len = config.recurrent_seq_len
+        self.recurrent_init = nn.Parameter(torch.randn(config.n_embed))
+        self.recurrent_init_rope = RotaryEncoding(config.n_embed, config.recurrent_seq_len)
         self.input = InputLayer(config)
         self.ponder = RNNPonder(config)
+
+    def make_recurrent_init(self):
+        recurrent_init = self.recurrent_init.unsqueeze(0) \
+            .repeat_interleave(self.recurrent_seq_len, 0)
+        return self.recurrent_init_rope(recurrent_init)
 
     def forward(self):
         # this module probably needs more than just forward()
