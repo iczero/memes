@@ -467,7 +467,7 @@ class TrainHelper:
             for i, grad in enumerate(DEBUG_RECURRENT_GRAD):
                 if grad is None:
                     continue
-                grad = grad.cpu()
+                grad = grad.to(device='cpu', dtype=torch.float32)
                 x.append(i)
                 # pylint: disable-next=not-callable
                 y.append(torch.linalg.norm(grad, dim=-1).mean())

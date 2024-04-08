@@ -142,8 +142,8 @@ class TrainConfig:
     def make_param_groups(self, named_parameters):
         exclude_wd = []
         default = []
-        for name, param in named_parameters:
-            if len(param.shape) < 2 or name == 'recurrent_init':
+        for _name, param in named_parameters:
+            if len(param.shape) < 2:
                 exclude_wd.append(param)
             else:
                 default.append(param)
