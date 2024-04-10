@@ -160,7 +160,7 @@ class TrainConfig:
                 groups,
                 self.lr,
                 # test
-                betas=(0.8, 0.95),
+                #betas=(0.8, 0.95),
                 weight_decay=self.weight_decay,
                 fused=allow_fused,
             )
