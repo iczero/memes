@@ -1,6 +1,6 @@
 sentencepiece
 matplotlib
-torch
+#torch
 aim
 safetensors
 tqdm
