@@ -6,3 +6,4 @@ safetensors
 tqdm
 zstandard
 pyarrow
+lxml

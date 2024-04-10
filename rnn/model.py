@@ -190,13 +190,11 @@ class IntermediateLayer(nn.Module):
         return recurrent + recurrent_resid, internal + internal_resid
 
 class OutputDecode(nn.Module):
-    "Derive output token and ponder confidence from internal state"
+    "Derive output token from internal state"
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.n_embed = config.n_embed
-
         self.norm = nn.LayerNorm((config.n_embed,))
-
         # standard cross-attention scheme except queries are directly parameters
         self.q_out = nn.Parameter(torch.randn(config.n_embed))
         self.kv_linear_out = nn.Linear(
@@ -204,14 +202,6 @@ class OutputDecode(nn.Module):
             2 * config.n_embed,
             bias=config.qkv_bias,
         )
-
-        self.q_confidence = nn.Parameter(torch.randn(config.n_embed))
-        self.kv_linear_confidence = nn.Linear(
-            config.n_embed,
-            2 * config.n_embed,
-            bias=config.qkv_bias,
-        )
-
         self.ff_out = nn.Sequential(
             nn.Linear(config.n_embed, config.ff_dim_multiplier * config.n_embed),
             config.get_activation(),
@@ -219,43 +209,29 @@ class OutputDecode(nn.Module):
             nn.Linear(config.n_embed, config.vocab_size),
         )
 
-        self.ff_confidence = nn.Sequential(
-            nn.Linear(config.n_embed, config.n_embed),
-            config.get_activation(),
-            nn.Linear(config.n_embed, 1), # confidence
-        )
-
     def forward(self, internal: torch.Tensor):
         # in: (batch, seq, n_embed)
         internal = self.norm(internal)
 
-        q = torch.stack((
-            self.q_out.unsqueeze(0),
-            self.q_confidence.unsqueeze(0),
-        ), dim=0)
-        # -> (out/halt, "seq", n_embed)
+        q = self.q_out.unsqueeze(0)
+        # -> ("seq", n_embed)
 
-        kv_merged = torch.stack((
-            self.kv_linear_out(internal).unflatten(-1, (2, self.n_embed)),
-            self.kv_linear_confidence(internal).unflatten(-1, (2, self.n_embed)),
-        ), dim=-4)
-        # kv_merged: (batch, out/halt, seq, k/v, n_embed)
+        kv_merged = self.kv_linear_out(internal).unflatten(-1, (2, self.n_embed))
+        # kv_merged: (batch, seq, k/v, n_embed)
         # extract k/v for sdp
         k = kv_merged[..., 0, :]
         v = kv_merged[..., 1, :]
-        # -> (batch, out/halt, seq, n_embed)
+        # -> (batch, seq, n_embed)
 
         # no dropout here
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
 
-        # (batch, out/halt, "seq", n_embed) -> (batch, n_embed)
-        token_out = self.ff_out(attn_out[..., 0, 0, :])
-        # -> (batch, 1)
-        confidence_out = self.ff_confidence(attn_out[..., 1, 0, :])
+        # (batch, "seq", n_embed) -> (batch, n_embed)
+        token_out = self.ff_out(attn_out[..., 0, :])
 
-        # out: (batch, vocab_size), (batch)
-        return token_out, confidence_out.squeeze(-1)
+        # out: (batch, vocab_size)
+        return token_out
 
 class RNNPonder(nn.Module):
     """
@@ -274,15 +250,14 @@ class RNNPonder(nn.Module):
             IntermediateLayer(config) for _ in range(config.n_intermediate))
         self.output = OutputDecode(config)
 
-    # recurrent is recurrent state, internal is output of input layer, or if
-    # pondering, the internal output of the previous RNNPonder step
+    # recurrent is recurrent state, internal is output of input layer
     def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
         # in: (batch, seq, n_embed)
         for layer in self.intermediate:
             recurrent, internal = layer(recurrent, internal)
 
-        token_out, confidence_out = self.output(internal)
-        return recurrent, internal, token_out, confidence_out
+        token_out = self.output(internal)
+        return recurrent, internal, token_out
 
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -298,6 +273,7 @@ class RNNSequence(nn.Module):
             .repeat_interleave(self.recurrent_seq_len, 0)
         return self.recurrent_init_rope(recurrent_init)
 
-    def forward(self):
-        # this module probably needs more than just forward()
-        raise NotImplementedError()
+    def forward(self, recurrent: torch.Tensor, short_ctx: torch.Tensor):
+        internal = self.input(short_ctx)
+        recurrent, internal, token_out = self.ponder(recurrent, internal)
+        return recurrent, internal, token_out
