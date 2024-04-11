@@ -40,8 +40,6 @@ class TrainSequence:
     "If the sequence has reached the end"
     losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
     "List of losses for all steps"
-    was_backspace: bool = False
-    "If the last token was randomized for backspace"
 
 class TrainBatch:
     model_config: ModelConfig
@@ -55,7 +53,6 @@ class TrainBatch:
     sequence_provider: SequenceProvider
     batch_size: int
     "Size of this batch"
-    shortctx_dropout_mask: torch.Tensor
 
     def __init__(
         self,
@@ -78,11 +75,6 @@ class TrainBatch:
         self.sequence_provider = sequence_provider
 
         self.pad_token = torch.tensor(tokenizer['<pad>'], dtype=torch.int64, device=self.device)
-        self.shortctx_dropout_mask = torch.tensor(
-            [train_config.short_ctx_dropout_p] * (model_config.short_ctx_len - 1) + [0.],
-            dtype=torch.float32,
-            device=self.device,
-        )
 
     def next_sequence(self) -> list[int]:
         if self.sequence_provider is None:

@@ -13,7 +13,6 @@ class PartialCrossAttention(nn.Module):
         super().__init__()
         self.n_attention_heads = config.n_attention_heads
         self.n_embed = config.n_embed
-        self.attn_dropout_p = config.attn_dropout_p
         # in: external: (batch, seq, n_embed), internal: (batch, seq, n_embed)
         # split these two since q and k/v have different inputs
         self.q_linear = nn.Linear(
@@ -46,7 +45,7 @@ class PartialCrossAttention(nn.Module):
 
         # why does pylint think this isn't callable?
         # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
 
         # transpose back
         attn_out = attn_out.transpose(-2, -3)
@@ -71,11 +70,8 @@ class SelfAttention(nn.Module):
         if is_input_layer:
             # use rotary positional encoding
             self.rope = RotaryEncoding(config.n_embed, config.short_ctx_len)
-            # do not use dropout in input layer (does this make a difference?)
-            self.attn_dropout = 0
         else:
             self.rope = None
-            self.attn_dropout = config.attn_dropout_p
 
     def forward(self, sequence: torch.Tensor):
         # kv_merged shape: (batch, seq, 3 (q/k/v), n_heads, n_embed)
@@ -93,7 +89,7 @@ class SelfAttention(nn.Module):
 
         # why does pylint think this isn't callable?
         # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
 
         # transpose back
         return attn_out.transpose(-2, -3)
@@ -117,7 +113,6 @@ class GatedFeedForward(nn.Module):
             config.get_activation(),
             nn.Linear(mid_dim, mid_dim),
             config.get_activation(),
-            nn.Dropout(config.ff_dropout_p),
             nn.Linear(mid_dim, out_dim),
         )
 
@@ -135,7 +130,6 @@ class InputLayer(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.attn_dropout_p = config.attn_dropout_p
         self.short_ctx_len = config.short_ctx_len
         # in: (batch, seq)
         self.input_embedding = nn.Embedding(config.vocab_size, config.n_embed)
@@ -152,7 +146,6 @@ class InputLayer(nn.Module):
             config.get_activation(),
             nn.Linear(ff_mid_dim, ff_mid_dim),
             config.get_activation(),
-            nn.Dropout(config.ff_dropout_p),
             nn.Linear(ff_mid_dim, config.n_embed),
         )
 
@@ -223,7 +216,6 @@ class OutputDecode(nn.Module):
         v = kv_merged[..., 1, :]
         # -> (batch, seq, n_embed)
 
-        # no dropout here
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
 
@@ -263,7 +255,6 @@ class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.recurrent_seq_len = config.recurrent_seq_len
-        self.recurrent_init = nn.Parameter(torch.randn(config.n_embed))
         self.recurrent_init_rope = RotaryEncoding(config.n_embed, config.recurrent_seq_len)
         self.input = InputLayer(config)
         self.ponder = RNNPonder(config)
