@@ -76,6 +76,7 @@ class TrainBatch:
     "Size of this batch"
     p_not_halt: torch.Tensor
     "Running probability that all previous ponder steps have not halted"
+    # TODO: not anymore
 
     def __init__(
         self,
@@ -209,18 +210,19 @@ class TrainBatch:
         cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
         confidence_losses = self.train_config.confidence_scale * \
             confidence_loss(cross_entropy, confidence_out, prev_loss_mean, prev_loss_std)
-        p_halt_out = torch.max(
-            F.sigmoid(confidence_out + self.model_config.ponder_adjust),
-            torch.tensor(min_p_halt),
-        )
-        did_halt = p_halt_out.detach().bernoulli() > 0
+        # p_halt_out does not need grad
+        p_halt_out = F.sigmoid(confidence_out.detach() + self.model_config.ponder_adjust)
+        # enforce min_p_halt when determining halt only
+        did_halt = torch.maximum(p_halt_out, torch.tensor(min_p_halt)).bernoulli() > 0
 
-        # P(halt | not previously halted) * ponder step loss
-        weighted_losses = p_not_halt * p_halt_out.detach() * cross_entropy + confidence_losses
+        step_weight = p_halt_out ** 3
+        # if halted, override to 1
+        step_weight = torch.where(did_halt, 1., step_weight)
+        weighted_losses = p_not_halt * step_weight * cross_entropy + confidence_losses
 
         # prepare next p_not_halt
         # reset p_not_halt if halted, otherwise add current
-        p_not_halt_next = torch.where(did_halt, 1., p_not_halt * (1 - p_halt_out.detach()))
+        p_not_halt_next = torch.where(did_halt, 1., p_not_halt * (1 - step_weight))
 
         return next_recurrent, next_internal, token_out, confidence_out, p_halt_out, \
             did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_next
