@@ -176,7 +176,8 @@ class InferenceHelper:
                 top_p_threshold = (tokens_dist_cumulative < top_p).tolist()
                 if False in top_p_threshold:
                     max_index = top_p_threshold.index(False) + 1
-                    tokens_dist = tokens_sorted[..., :torch.tensor(max_index, device='cpu')]
+                    tokens_dist = tokens_sorted[..., :max_index]
+                    tokens_indices = tokens_indices[..., :max_index]
                 else:
                     tokens_dist = tokens_sorted
 
