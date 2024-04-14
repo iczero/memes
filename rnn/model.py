@@ -14,6 +14,7 @@ class PartialCrossAttention(nn.Module):
         self.n_attention_heads = config.n_attention_heads
         self.n_embed = config.n_embed
         self.attn_dropout_p = config.attn_dropout_p
+        self.resid_gate_multiplier = config.resid_gate_multiplier
         # in: external: (batch, seq, n_embed), internal: (batch, seq, n_embed)
         # split these two since q and k/v have different inputs
         self.q_linear = nn.Linear(
@@ -29,6 +30,10 @@ class PartialCrossAttention(nn.Module):
         # https://arxiv.org/pdf/2110.09456.pdf
         # TODO: go make references section
         self.head_scales = nn.Parameter(torch.zeros((config.n_attention_heads,)))
+        self.out_linear = nn.Linear(
+            config.n_attention_heads * config.n_embed,
+            config.n_embed + 1,
+        )
 
     def forward(self, internal: torch.Tensor, external: torch.Tensor):
         # external is the other sequence concatenated to k/v, internal is our own sequence
@@ -52,7 +57,13 @@ class PartialCrossAttention(nn.Module):
         attn_out = attn_out.transpose(-2, -3)
 
         # scale heads
-        return attn_out + self.head_scales.unsqueeze(-1) * attn_out
+        attn_scaled = attn_out + self.head_scales.unsqueeze(-1) * attn_out
+
+        # concat all heads
+        out = self.out_linear(attn_scaled.flatten(start_dim=-2, end_dim=-1))
+        resid_gate = F.sigmoid(out[..., -1]) * self.resid_gate_multiplier
+        resid = out[..., :-1]
+        return resid * resid_gate.unsqueeze(-1)
 
 class SelfAttention(nn.Module):
     "Self attention layer with positional encoding"
@@ -60,12 +71,17 @@ class SelfAttention(nn.Module):
     def __init__(self, config: ModelConfig, is_input_layer=False):
         super().__init__()
         self.n_attention_heads = config.n_attention_heads
+        self.resid_gate_multiplier = config.resid_gate_multiplier
         self.n_embed = config.n_embed
         # in: (batch, seq, n_embed)
         self.qkv_linear = nn.Linear(
             config.n_embed,
             3 * config.n_attention_heads * config.n_embed,
             bias=config.qkv_bias,
+        )
+        self.out_linear = nn.Linear(
+            config.n_attention_heads * config.n_embed,
+            config.n_embed + 1,
         )
 
         if is_input_layer:
@@ -96,7 +112,12 @@ class SelfAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
 
         # transpose back
-        return attn_out.transpose(-2, -3)
+        attn_out = attn_out.transpose(-2, -3)
+        # concat
+        out = self.out_linear(attn_out.flatten(start_dim=-2, end_dim=-1))
+        resid_gate = F.sigmoid(out[..., -1]) * self.resid_gate_multiplier
+        resid = out[..., :-1]
+        return resid * resid_gate.unsqueeze(-1)
 
 class GatedFeedForward(nn.Module):
     "Feedforward after attention with residual gating"
@@ -104,15 +125,13 @@ class GatedFeedForward(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.register_buffer('resid_gate_multiplier', torch.tensor(config.resid_gate_multiplier))
-        in_dim = config.n_embed * config.n_attention_heads
+        in_dim = config.n_embed
         mid_dim = config.ff_dim_multiplier * config.n_embed
         out_dim = config.n_embed + 1
         # in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
         # out: residuals (batch, seq, n_embed) after gating
         # modified feedforward: dense after heads, then rescale back to n_embed
         self.stack = nn.Sequential(
-            # concat all heads
-            nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(in_dim, mid_dim),
             config.get_activation(),
             nn.Linear(mid_dim, mid_dim),
@@ -140,14 +159,13 @@ class InputLayer(nn.Module):
         # in: (batch, seq)
         self.input_embedding = nn.Embedding(config.vocab_size, config.n_embed)
         self.attention = SelfAttention(config, is_input_layer=True)
+        self.norm = nn.LayerNorm((config.n_embed,))
 
         # no residuals in input layer
-        # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
-        ff_in_dim = config.n_embed * config.n_attention_heads
+        # ff in: (batch, seq, n_embed)
+        ff_in_dim = config.n_embed
         ff_mid_dim = config.ff_dim_multiplier * config.n_embed
         self.feedforward = nn.Sequential(
-            # concat heads
-            nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(ff_in_dim, ff_mid_dim),
             config.get_activation(),
             nn.Linear(ff_mid_dim, ff_mid_dim),
@@ -157,11 +175,8 @@ class InputLayer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        # ensure sequence is of correct length
-        #assert x.shape[-1] == self.short_ctx_len
-
         embeddings = self.input_embedding(x)
-        attn_out = self.attention(embeddings)
+        attn_out = embeddings + self.attention(self.norm(embeddings))
 
         # out shape is (batch, seq, n_embed)
         return self.feedforward(attn_out)
@@ -181,13 +196,13 @@ class IntermediateLayer(nn.Module):
         recurrent_norm = self.norm(recurrent)
         internal_norm = self.norm(internal)
 
-        recurrent_resid = self.recurrent_attention(recurrent_norm, internal_norm)
-        recurrent_resid = self.recurrent_feedforward(recurrent_resid)
+        recurrent_1 = recurrent + self.recurrent_attention(recurrent_norm, internal_norm)
+        recurrent_2 = recurrent_1 + self.recurrent_feedforward(self.norm(recurrent_1))
 
-        internal_resid = self.internal_attention(internal_norm, recurrent_norm)
-        internal_resid = self.internal_feedforward(internal_resid)
+        internal_1 = internal + self.internal_attention(internal_norm, recurrent_norm)
+        internal_2 = internal_1 + self.internal_feedforward(self.norm(internal_1))
 
-        return recurrent + recurrent_resid, internal + internal_resid
+        return recurrent_2, internal_2
 
 class OutputDecode(nn.Module):
     "Derive output token and ponder confidence from internal state"
