@@ -204,7 +204,9 @@ class TrainBatch:
     ):
         # replace some tokens in short ctx with <pad>, but never "new" tokens
         short_ctx = torch.where(
-            (self.shortctx_dropout_mask.bernoulli() > 0).logical_and(new_mask.logical_not()),
+            (self.shortctx_dropout_mask.bernoulli() > 0)
+                .unsqueeze(0)
+                .logical_and(new_mask.logical_not()),
             self.pad_token,
             short_ctx,
         )
