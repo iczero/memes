@@ -143,7 +143,7 @@ class InputLayer(nn.Module):
 
         # why does pylint think this isn't callable?
         # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
 
         # transpose back
         attn_out = attn_out.transpose(-2, -3)

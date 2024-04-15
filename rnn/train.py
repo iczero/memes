@@ -57,8 +57,12 @@ class TrainSequence:
     "Unweighted cross entropy loss at the end of each halted step"
     confidence_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
     "History of confidence losses, for metrics"
-    was_backspace: bool = False
-    "If the last token was randomized for backspace"
+    backspace_placeholder: int | None = None
+    "If we are doing backspace, contains the bad replacement token"
+    backspace_gap: int = 4
+    "How many tokens to wait before doing backspace again"
+    prev_halted: bool = True
+    "If the previous step for this sequence halted"
 
 class TrainBatch:
     model_config: ModelConfig
@@ -131,13 +135,22 @@ class TrainBatch:
             short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
             next_token_val = info.sequence[info.offset + short_ctx_len]
 
-            if info.offset > 4 and torch.bernoulli(
-                torch.tensor(self.train_config.backspace_p, device='cpu')
-            ).item() > 0:
-                # inject bad token and backspace
-                short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
-                next_token_val = self.tokenizer['<del>']
-                info.was_backspace = True
+            if not info.ended:
+                if (
+                    info.prev_halted and
+                    info.backspace_placeholder is None and
+                    info.backspace_gap == 0 and
+                    torch.bernoulli(
+                        torch.tensor(self.train_config.backspace_p, device='cpu')
+                    ).item() > 0
+                ):
+                    # set backspace
+                    info.backspace_placeholder = random_token_not(len(self.tokenizer), short_ctx_l[-1])
+                    info.backspace_gap = 1
+
+                if info.backspace_placeholder is not None:
+                    short_ctx_l[-1] = info.backspace_placeholder
+                    next_token_val = self.tokenizer['<del>']
 
             # calculate new_mask and update prev_offset
             if info.prev_offset is None:
@@ -161,15 +174,14 @@ class TrainBatch:
             input_new_mask_list.append(new_mask)
             output_list.append(next_token)
 
-            print('\nprepare_batch(): sequences dump')
-            print(
-                '  batch element:', _i,
-                repr(''.join(self.tokenizer.IdToPiece(p) for p in short_ctx_l)),
-                '->',
-                repr(self.tokenizer.IdToPiece(next_token_val)),
-                'mask',
-                repr(new_mask_l),
-            )
+            # print('\nprepare_batch(): sequences dump')
+            # print(
+            #     '  batch element:', _i,
+            #     repr(''.join(self.tokenizer.IdToPiece(p) for p in short_ctx_l)),
+            #     '->',
+            #     repr(self.tokenizer.IdToPiece(next_token_val)),
+            # )
+            # print('           mask:', repr(new_mask_l))
 
         input_short_ctx = torch.stack(input_tokens_list, dim=0).to(self.device, non_blocking=True)
         input_new_mask = torch.stack(input_new_mask_list, dim=0).to(self.device, non_blocking=True)
@@ -192,7 +204,7 @@ class TrainBatch:
     ):
         # replace some tokens in short ctx with <pad>, but never "new" tokens
         short_ctx = torch.where(
-            self.shortctx_dropout_mask.bernoulli() > 0 and not new_mask,
+            (self.shortctx_dropout_mask.bernoulli() > 0).logical_and(new_mask.logical_not()),
             self.pad_token,
             short_ctx,
         )
@@ -273,15 +285,16 @@ class TrainBatch:
             info.losses.append(weighted_losses[i])
             info.confidence_losses.append(confidence_losses_cpu[i])
 
-            if did_halt_cpu[i]:
+            info.prev_halted = did_halt_cpu[i]
+            if info.prev_halted:
                 self.halted_sequences.append(i)
                 # record unweighted loss as well
                 info.halted_losses.append(cross_entropy_cpu[i])
 
-                if info.was_backspace:
+                if info.backspace_placeholder is not None:
                     # shift window back by one token
                     info.offset -= 1
-                    info.was_backspace = False
+                    info.backspace_placeholder = None
                 else:
                     # check if sequence ended
                     # we end one token before the last otherwise there is no "next" token to train on
@@ -290,6 +303,10 @@ class TrainBatch:
                     else:
                         # slide shortctx to include next token
                         info.offset += 1
+
+                    # tick down backspace_gap
+                    if info.backspace_gap > 0:
+                        info.backspace_gap -= 1
 
         return ended_count
 
