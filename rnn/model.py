@@ -54,50 +54,6 @@ class PartialCrossAttention(nn.Module):
         # scale heads
         return attn_out + self.head_scales.unsqueeze(-1) * attn_out
 
-class SelfAttention(nn.Module):
-    "Self attention layer with positional encoding"
-
-    def __init__(self, config: ModelConfig, is_input_layer=False):
-        super().__init__()
-        self.n_attention_heads = config.n_attention_heads
-        self.n_embed = config.n_embed
-        # in: (batch, seq, n_embed)
-        self.qkv_linear = nn.Linear(
-            config.n_embed,
-            3 * config.n_attention_heads * config.n_embed,
-            bias=config.qkv_bias,
-        )
-
-        if is_input_layer:
-            # use rotary positional encoding
-            self.rope = RotaryEncoding(config.n_embed, config.short_ctx_len)
-            # do not use dropout in input layer (does this make a difference?)
-            self.attn_dropout = 0
-        else:
-            self.rope = None
-            self.attn_dropout = config.attn_dropout_p
-
-    def forward(self, sequence: torch.Tensor):
-        # kv_merged shape: (batch, seq, 3 (q/k/v), n_heads, n_embed)
-        kv_merged = self.qkv_linear(sequence) \
-            .unflatten(-1, (3, self.n_attention_heads, self.n_embed))
-        # extract from merged
-        q = kv_merged[..., 0, :, :].transpose(-2, -3)
-        k = kv_merged[..., 1, :, :].transpose(-2, -3)
-        v = kv_merged[..., 2, :, :].transpose(-2, -3)
-
-        if self.rope is not None:
-            # apply positional encodings
-            q = self.rope(q)
-            k = self.rope(k)
-
-        # why does pylint think this isn't callable?
-        # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
-
-        # transpose back
-        return attn_out.transpose(-2, -3)
-
 class GatedFeedForward(nn.Module):
     "Feedforward after attention with residual gating"
 
@@ -137,17 +93,28 @@ class InputLayer(nn.Module):
         super().__init__()
         self.attn_dropout_p = config.attn_dropout_p
         self.short_ctx_len = config.short_ctx_len
+        self.n_attention_heads = config.n_attention_heads
+        self.n_embed = config.n_embed
+
         # in: (batch, seq)
         self.input_embedding = nn.Embedding(config.vocab_size, config.n_embed)
-        self.attention = SelfAttention(config, is_input_layer=True)
+
+        # in: (batch, seq, n_embed)
+        self.qkv_linear = nn.Linear(
+            config.n_embed,
+            3 * config.n_attention_heads * config.n_embed,
+            bias=config.qkv_bias,
+        )
+
+        # use rotary positional encoding
+        self.rope = RotaryEncoding(config.n_embed, config.short_ctx_len)
 
         # no residuals in input layer
-        # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
-        ff_in_dim = config.n_embed * config.n_attention_heads
+        # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed + 1)
+        # one more input for new_mask
+        ff_in_dim = config.n_embed * config.n_attention_heads + 1
         ff_mid_dim = config.ff_dim_multiplier * config.n_embed
         self.feedforward = nn.Sequential(
-            # concat heads
-            nn.Flatten(start_dim=-2, end_dim=-1),
             nn.Linear(ff_in_dim, ff_mid_dim),
             config.get_activation(),
             nn.Linear(ff_mid_dim, ff_mid_dim),
@@ -156,15 +123,39 @@ class InputLayer(nn.Module):
             nn.Linear(ff_mid_dim, config.n_embed),
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, tokens: torch.Tensor, new_mask: torch.Tensor):
         # ensure sequence is of correct length
         #assert x.shape[-1] == self.short_ctx_len
 
-        embeddings = self.input_embedding(x)
-        attn_out = self.attention(embeddings)
+        embeddings = self.input_embedding(tokens)
+
+        # kv_merged shape: (batch, seq, 3 (q/k/v), n_heads, n_embed)
+        kv_merged = self.qkv_linear(embeddings) \
+            .unflatten(-1, (3, self.n_attention_heads, self.n_embed))
+        # extract from merged
+        q = kv_merged[..., 0, :, :].transpose(-2, -3)
+        k = kv_merged[..., 1, :, :].transpose(-2, -3)
+        v = kv_merged[..., 2, :, :].transpose(-2, -3)
+
+        # apply positional encoding
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # why does pylint think this isn't callable?
+        # pylint: disable-next=not-callable
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
+
+        # transpose back
+        attn_out = attn_out.transpose(-2, -3)
+
+        # concat heads and add new token mark
+        ff_in = torch.cat((
+            attn_out.flatten(-2, -1),
+            torch.where(new_mask, 1., 0.).unsqueeze(-1)
+        ), dim=-1)
 
         # out shape is (batch, seq, n_embed)
-        return self.feedforward(attn_out)
+        return self.feedforward(ff_in)
 
 class IntermediateLayer(nn.Module):
     "The intermediate layers(s) of the model"
@@ -257,47 +248,26 @@ class OutputDecode(nn.Module):
         # out: (batch, vocab_size), (batch)
         return token_out, confidence_out.squeeze(-1)
 
-class RNNPonder(nn.Module):
-    """
-    The part of the model rerun for ponder
-
-    Contains intermediate layers followed by the decode layer. Does not contain
-    the input layer, which should be run before.
-    """
-
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.short_ctx_len = config.short_ctx_len
-        self.recurrent_seq_len = config.recurrent_seq_len
-
-        self.intermediate = nn.ModuleList(
-            IntermediateLayer(config) for _ in range(config.n_intermediate))
-        self.output = OutputDecode(config)
-
-    # recurrent is recurrent state, internal is output of input layer, or if
-    # pondering, the internal output of the previous RNNPonder step
-    def forward(self, recurrent: torch.Tensor, internal: torch.Tensor):
-        # in: (batch, seq, n_embed)
-        for layer in self.intermediate:
-            recurrent, internal = layer(recurrent, internal)
-
-        token_out, confidence_out = self.output(internal)
-        return recurrent, internal, token_out, confidence_out
-
 class RNNSequence(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.recurrent_seq_len = config.recurrent_seq_len
         self.recurrent_init = nn.Parameter(torch.randn(config.n_embed))
         self.recurrent_init_rope = RotaryEncoding(config.n_embed, config.recurrent_seq_len)
+
         self.input = InputLayer(config)
-        self.ponder = RNNPonder(config)
+        self.intermediate = nn.ModuleList(
+            IntermediateLayer(config) for _ in range(config.n_intermediate))
+        self.output = OutputDecode(config)
 
     def make_recurrent_init(self):
         recurrent_init = self.recurrent_init.unsqueeze(0) \
             .repeat_interleave(self.recurrent_seq_len, 0)
         return self.recurrent_init_rope(recurrent_init)
 
-    def forward(self):
-        # this module probably needs more than just forward()
-        raise NotImplementedError()
+    def forward(self, recurrent: torch.Tensor, short_ctx: torch.Tensor, new_mask: torch.Tensor):
+        internal = self.input(short_ctx, new_mask)
+        for layer in self.intermediate:
+            recurrent, internal = layer(recurrent, internal)
+        token_out, confidence_out = self.output(internal)
+        return recurrent, token_out, confidence_out

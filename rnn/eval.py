@@ -73,64 +73,23 @@ class InferenceHelper:
     def get_output(self):
         return self.sequence[self.config.short_ctx_len : self.offset_end]
 
-    def step(self, short_ctx: torch.Tensor, max_ponder = 16) -> torch.Tensor:
-        internal = self.model.input(short_ctx)
+    @torch.compile(disable=DISABLE_TORCH_COMPILE)
+    def _forward(self, recurrent: torch.Tensor, short_ctx: torch.Tensor, new_mask: torch.Tensor):
+        return self.model(recurrent, short_ctx, new_mask)
+
+    def noisy_step(self, short_ctx: torch.Tensor, new_mask: torch.Tensor, max_ponder = 16):
         halt = False
         ponder_count = 0
         while not halt:
-            self.recurrent, internal, token_logits, confidence_logit = \
-                self.model.ponder(self.recurrent, internal)
-            p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
-            halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
-            if halt:
-                return token_logits
-
-            ponder_count += 1
-
-    def generate_tokens(self, limit = 256, max_ponder = 16, temperature = 1.0):
-        count = 0
-        while count < limit:
-            count += 1
-            short_ctx = self.current_context()
-            token_logits = self.step(short_ctx, max_ponder)
-            dist = (token_logits / temperature).softmax(-1)
-            token = dist.multinomial(1).item()
-            yield token, dist
-
-            if token == self.tokenizer['<del>']:
-                self.offset -= 1
-                continue
-
-            self.set_token(self.offset_end, token)
-            self.offset += 1
-
-    def feed(self, tokens: list[int]):
-        for token in tokens:
-            self.set_token(self.offset_end, token)
-            self.offset += 1
-            self.step(self.current_context())
-
-    @torch.compile(disable=DISABLE_TORCH_COMPILE)
-    def _forward_input(self, short_ctx: torch.Tensor):
-        return self.model.input(short_ctx)
-
-    @torch.compile(disable=DISABLE_TORCH_COMPILE)
-    def _forward_ponder(self, recurrent: torch.Tensor, internal: torch.Tensor):
-        return self.model.ponder(recurrent, internal)
-
-    def noisy_step(self, short_ctx: torch.Tensor, max_ponder = 16):
-        internal = self._forward_input(short_ctx)
-        halt = False
-        ponder_count = 0
-        while not halt:
-            self.recurrent, internal, token_logits, confidence_logit = \
-                self._forward_ponder(self.recurrent, internal)
+            self.recurrent, token_logits, confidence_logit = \
+                self._forward(self.recurrent, short_ctx, new_mask)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
             halt = (torch.bernoulli(p_halt) > 0).item() or ponder_count >= max_ponder
             yield halt, ponder_count, confidence_logit, p_halt, token_logits
             if halt:
                 return
 
+            new_mask.copy_(torch.tensor(False))
             ponder_count += 1
 
     def noisy_generate(

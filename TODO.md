@@ -27,3 +27,7 @@
 - port to torch_xla or jax for TRC
   - this stupid project is now sponsored by google
   - figure out why it does not converge on torch_xla
+- document stuff
+  - confidence is the model's prediction of the relative loss of its output
+  - new_mask is True for every token position not in the previous input's
+    short_ctx, False otherwise

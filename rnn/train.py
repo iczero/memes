@@ -45,6 +45,8 @@ def confidence_loss(
 class TrainSequence:
     sequence: list[int]
     "Token sequence"
+    new_mask: list[bool] = dataclasses.field(init=False)
+    "Mask for new tokens"
     offset: int = 0
     "Current offset into the seqeuence"
     ended: bool = False
@@ -55,10 +57,11 @@ class TrainSequence:
     "Unweighted cross entropy loss at the end of each halted step"
     confidence_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
     "History of confidence losses, for metrics"
-    prev_internal: torch.Tensor | None = None
-    "Previous internal state, if not halted"
     was_backspace: bool = False
     "If the last token was randomized for backspace"
+
+    def __post_init__(self):
+        self.new_mask = [True] * len(self.sequence)
 
 class TrainBatch:
     model_config: ModelConfig
@@ -100,7 +103,7 @@ class TrainBatch:
 
         self.pad_token = torch.tensor(tokenizer['<pad>'], dtype=torch.int64, device=self.device)
         self.shortctx_dropout_mask = torch.tensor(
-            [train_config.short_ctx_dropout_p] * (model_config.short_ctx_len - 1) + [0.],
+            [train_config.short_ctx_dropout_p] * model_config.short_ctx_len,
             dtype=torch.float32,
             device=self.device,
         )
@@ -121,42 +124,25 @@ class TrainBatch:
         self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
         self.halted_sequences = list(range(self.batch_size))
 
-    @torch.compile(disable=DISABLE_TORCH_COMPILE, dynamic=True)
-    def forward_input_batch(self, input_encode: torch.Tensor):
-        # replace some tokens in short ctx with <pad>, but never the last
-        input_encode = torch.where(
-            self.shortctx_dropout_mask.bernoulli() > 0,
-            self.pad_token,
-            input_encode,
-        )
-        return self.model.input(input_encode)
-
-    def prepare_internal_batch(self):
+    def prepare_batch(self):
+        # prepare inputs and expected output
         short_ctx_len = self.model_config.short_ctx_len
-        # construct batch for input layer
-        input_batch: list[tuple[int, torch.Tensor]] = []
-        input_sequences: list[torch.Tensor | None] = []
+        input_tokens_list: list[torch.Tensor] = []
+        input_new_mask_list: list[torch.Tensor] = []
         output_list: list[torch.Tensor] = []
-        for i, info in enumerate(self.sequences):
-            # short_ctx_l = None
-            if info.prev_internal is not None:
-                assert i not in self.halted_sequences
-                input_sequences.append(info.prev_internal)
-            else:
-                assert i in self.halted_sequences
-                assert not info.ended
-                # prepare batch for input layer
-                short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
-                if info.offset > 4 and torch.bernoulli(
-                    torch.tensor(self.train_config.backspace_p, device='cpu')
-                ).item() > 0:
-                    short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
-                    info.offset -= 1
-                    info.was_backspace = True
-                short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=True)
-                input_batch.append((i, short_ctx))
-                # will be substitued later
-                input_sequences.append(None)
+        for _i, info in enumerate(self.sequences):
+            short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
+            new_mask_l = info.new_mask[info.offset : info.offset + short_ctx_len]
+            if info.offset > 4 and torch.bernoulli(
+                torch.tensor(self.train_config.backspace_p, device='cpu')
+            ).item() > 0:
+                short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
+                info.offset -= 1
+                info.was_backspace = True
+            short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=True)
+            new_mask = torch.tensor(new_mask_l, dtype=torch.bool, device='cpu', pin_memory=True)
+            input_tokens_list.append(short_ctx)
+            input_new_mask_list.append(new_mask)
 
             # grab next token
             if info.was_backspace:
@@ -166,48 +152,47 @@ class TrainBatch:
             next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu', pin_memory=True)
             output_list.append(next_token)
 
-            # print('\nprepare_internal_batch(): sequences dump')
-            # if short_ctx_l is None:
-            #     short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
-            # print(
-            #     '  batch element:', i,
-            #     repr(''.join(self.tokenizer.IdToPiece(p) for p in short_ctx_l)),
-            #     '->',
-            #     repr(self.tokenizer.IdToPiece(next_token.item())),
-            # )
+            print('\nprepare_batch(): sequences dump')
+            print(
+                '  batch element:', _i,
+                repr(''.join(self.tokenizer.IdToPiece(p) for p in short_ctx_l)),
+                '->',
+                repr(self.tokenizer.IdToPiece(next_token.item())),
+                'mask',
+                repr(new_mask_l),
+            )
 
-        if len(input_batch) > 0:
-            # run input batch
-            input_encode = torch.stack([v[1] for v in input_batch], dim=0).to(self.device, non_blocking=True)
-            # unfortunately, it does not, well, work
-            #torch._dynamo.mark_dynamic(input_encode, 0)
-            input_encode = self.forward_input_batch(input_encode)
-
-            for item, encoded in zip(input_batch, input_encode):
-                # input_encode first dimension is batch
-                input_sequences[item[0]] = encoded
-
-        input_array = torch.stack(input_sequences, dim=0)
+        input_short_ctx = torch.stack(input_tokens_list, dim=0).to(self.device, non_blocking=True)
+        input_new_mask = torch.stack(input_new_mask_list, dim=0).to(self.device, non_blocking=True)
         output_array = torch.stack(output_list, dim=0).to(self.device, non_blocking=True)
 
-        return input_array, output_array
+        return input_short_ctx, input_new_mask, output_array
 
     @torch.compile(disable=DISABLE_TORCH_COMPILE)
     def forward_ponder_batch(
         self,
         recurrent: torch.Tensor,
-        internal: torch.Tensor,
-        expected_tokens: torch.Tensor,
+        short_ctx: torch.Tensor,
+        new_mask: torch.Tensor,
+        expected_output: torch.Tensor,
         # this value should not change during training
         min_p_halt: float,
         p_not_halt: torch.Tensor,
         prev_loss_mean: torch.Tensor,
         prev_loss_std: torch.Tensor,
     ):
-        next_recurrent, next_internal, token_out, confidence_out = \
-            self.model.ponder(recurrent, internal)
+        # replace some tokens in short ctx with <pad>, but never "new" tokens
+        short_ctx = torch.where(
+            self.shortctx_dropout_mask.bernoulli() > 0 and not new_mask,
+            self.pad_token,
+            short_ctx,
+        )
 
-        cross_entropy = F.cross_entropy(token_out, expected_tokens, reduction='none')
+        # forward model
+        next_recurrent, token_out, confidence_out = self.model(recurrent, short_ctx, new_mask)
+
+        # calculate losses
+        cross_entropy = F.cross_entropy(token_out, expected_output, reduction='none')
         confidence_losses = self.train_config.confidence_scale * \
             confidence_loss(cross_entropy, confidence_out, prev_loss_mean, prev_loss_std)
         # p_halt_out does not need grad
@@ -224,18 +209,20 @@ class TrainBatch:
         # reset p_not_halt if halted, otherwise add current
         p_not_halt_next = torch.where(did_halt, 1., p_not_halt * (1 - step_weight))
 
-        return next_recurrent, next_internal, token_out, confidence_out, p_halt_out, \
+        return next_recurrent, token_out, confidence_out, p_halt_out, \
             did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_next
 
     def forward_step(self):
-        internal, expected_tokens = self.prepare_internal_batch()
+        short_ctx_len = self.model_config.short_ctx_len
+        input_short_ctx, input_new_mask, expected_output = self.prepare_batch()
 
-        next_recurrent, next_internal, _token_out, _confidence_out, _p_halt_out, did_halt, \
+        next_recurrent, _token_out, _confidence_out, _p_halt_out, did_halt, \
             cross_entropy, confidence_losses, weighted_losses, p_not_halt_next = \
             self.forward_ponder_batch(
                 self.recurrent,
-                internal,
-                expected_tokens,
+                input_short_ctx,
+                input_new_mask,
+                expected_output,
                 min_p_halt=self.train_config.min_p_halt,
                 p_not_halt=self.p_not_halt,
                 # prevent torch.compile from recompiling on change
@@ -278,28 +265,22 @@ class TrainBatch:
             info.confidence_losses.append(confidence_losses_cpu[i])
 
             if did_halt_cpu[i]:
-                info.prev_internal = None
                 # record unweighted loss as well
                 info.halted_losses.append(cross_entropy_cpu[i])
 
                 # check if sequence ended
                 # we end one token before the last otherwise there is no "next" token to train on
-                if info.offset + self.model_config.short_ctx_len >= len(info.sequence) - 1:
+                if info.offset + short_ctx_len >= len(info.sequence) - 1:
                     info.ended = True
-                    # introduce dummy internal sequence
-                    info.prev_internal = torch.zeros((
-                        self.model_config.short_ctx_len,
-                        self.model_config.n_embed,
-                    ), device=self.device, dtype=self.dtype)
                 else:
                     # slide shortctx to include next token
                     if not info.was_backspace:
                         info.offset += 1
+                        # mark tokens seen
+                        info.new_mask[info.offset : info.offset + short_ctx_len] = [False] * short_ctx_len
                     else:
                         info.was_backspace = False
                     self.halted_sequences.append(i)
-            else:
-                info.prev_internal = next_internal[i]
 
         return ended_count
 
