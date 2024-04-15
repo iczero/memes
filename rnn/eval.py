@@ -25,6 +25,8 @@ class InferenceHelper:
     "Current sequence"
     offset: int
     "Offset into sequence"
+    prev_offset: int | None
+    "Previous offset"
     recurrent: torch.Tensor
     "Recurrent state of model"
 
@@ -52,6 +54,7 @@ class InferenceHelper:
 
     def initialize(self):
         self.offset = 0
+        self.prev_offset = None
         self.sequence = [self.tokenizer['<pad>']] * self.config.short_ctx_len
         self.recurrent = self.model.make_recurrent_init()
 
@@ -77,10 +80,27 @@ class InferenceHelper:
     def _forward(self, recurrent: torch.Tensor, short_ctx: torch.Tensor, new_mask: torch.Tensor):
         return self.model(recurrent, short_ctx, new_mask)
 
-    def noisy_step(self, short_ctx: torch.Tensor, new_mask: torch.Tensor, max_ponder = 16):
+    def noisy_step(self, short_ctx: torch.Tensor, max_ponder = 16):
         halt = False
         ponder_count = 0
+        short_ctx_len = self.config.short_ctx_len
+
         while not halt:
+            # calculate new_mask and update prev_offset
+            if self.prev_offset is None:
+                # no previous iteration
+                new_mask_l = [True] * short_ctx_len
+            else:
+                new_mask_l = [False] * short_ctx_len
+                if self.offset > self.prev_offset:
+                    delta = self.offset - self.prev_offset
+                    new_mask_l[-delta:] = [True] * delta
+                elif self.offset < self.prev_offset:
+                    delta = self.prev_offset - self.offset
+                    new_mask_l[:delta] = [True] * delta
+            self.prev_offset = self.offset
+            new_mask = torch.tensor(new_mask_l, dtype=torch.bool, device=self.device)
+
             self.recurrent, token_logits, confidence_logit = \
                 self._forward(self.recurrent, short_ctx, new_mask)
             p_halt = F.sigmoid(confidence_logit + self.config.ponder_adjust)
@@ -89,7 +109,6 @@ class InferenceHelper:
             if halt:
                 return
 
-            new_mask.copy_(torch.tensor(False))
             ponder_count += 1
 
     def noisy_generate(

@@ -45,10 +45,10 @@ def confidence_loss(
 class TrainSequence:
     sequence: list[int]
     "Token sequence"
-    new_mask: list[bool] = dataclasses.field(init=False)
-    "Mask for new tokens"
     offset: int = 0
     "Current offset into the seqeuence"
+    prev_offset: int | None = None
+    "Previous offset"
     ended: bool = False
     "If the sequence has reached the end"
     losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
@@ -59,9 +59,6 @@ class TrainSequence:
     "History of confidence losses, for metrics"
     was_backspace: bool = False
     "If the last token was randomized for backspace"
-
-    def __post_init__(self):
-        self.new_mask = [True] * len(self.sequence)
 
 class TrainBatch:
     model_config: ModelConfig
@@ -132,24 +129,36 @@ class TrainBatch:
         output_list: list[torch.Tensor] = []
         for _i, info in enumerate(self.sequences):
             short_ctx_l = info.sequence[info.offset : info.offset + short_ctx_len]
-            new_mask_l = info.new_mask[info.offset : info.offset + short_ctx_len]
+            next_token_val = info.sequence[info.offset + short_ctx_len]
+
             if info.offset > 4 and torch.bernoulli(
                 torch.tensor(self.train_config.backspace_p, device='cpu')
             ).item() > 0:
+                # inject bad token and backspace
                 short_ctx_l[-1] = random_token_not(len(self.tokenizer), short_ctx_l[-1])
-                info.offset -= 1
+                next_token_val = self.tokenizer['<del>']
                 info.was_backspace = True
+
+            # calculate new_mask and update prev_offset
+            if info.prev_offset is None:
+                # no previous iteration
+                new_mask_l = [True] * short_ctx_len
+            else:
+                new_mask_l = [False] * short_ctx_len
+                if info.offset > info.prev_offset:
+                    delta = info.offset - info.prev_offset
+                    new_mask_l[-delta:] = [True] * delta
+                elif info.offset < info.prev_offset:
+                    delta = info.prev_offset - info.offset
+                    new_mask_l[:delta] = [True] * delta
+            info.prev_offset = info.offset
+
             short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=True)
             new_mask = torch.tensor(new_mask_l, dtype=torch.bool, device='cpu', pin_memory=True)
+            next_token = torch.tensor(next_token_val, dtype=torch.int64, device='cpu', pin_memory=True)
+
             input_tokens_list.append(short_ctx)
             input_new_mask_list.append(new_mask)
-
-            # grab next token
-            if info.was_backspace:
-                next_token = self.tokenizer['<del>']
-            else:
-                next_token = info.sequence[info.offset + short_ctx_len]
-            next_token = torch.tensor(next_token, dtype=torch.int64, device='cpu', pin_memory=True)
             output_list.append(next_token)
 
             print('\nprepare_batch(): sequences dump')
@@ -157,7 +166,7 @@ class TrainBatch:
                 '  batch element:', _i,
                 repr(''.join(self.tokenizer.IdToPiece(p) for p in short_ctx_l)),
                 '->',
-                repr(self.tokenizer.IdToPiece(next_token.item())),
+                repr(self.tokenizer.IdToPiece(next_token_val)),
                 'mask',
                 repr(new_mask_l),
             )
@@ -169,7 +178,7 @@ class TrainBatch:
         return input_short_ctx, input_new_mask, output_array
 
     @torch.compile(disable=DISABLE_TORCH_COMPILE)
-    def forward_ponder_batch(
+    def forward_batch(
         self,
         recurrent: torch.Tensor,
         short_ctx: torch.Tensor,
@@ -218,7 +227,7 @@ class TrainBatch:
 
         next_recurrent, _token_out, _confidence_out, _p_halt_out, did_halt, \
             cross_entropy, confidence_losses, weighted_losses, p_not_halt_next = \
-            self.forward_ponder_batch(
+            self.forward_batch(
                 self.recurrent,
                 input_short_ctx,
                 input_new_mask,
@@ -265,22 +274,22 @@ class TrainBatch:
             info.confidence_losses.append(confidence_losses_cpu[i])
 
             if did_halt_cpu[i]:
+                self.halted_sequences.append(i)
                 # record unweighted loss as well
                 info.halted_losses.append(cross_entropy_cpu[i])
 
-                # check if sequence ended
-                # we end one token before the last otherwise there is no "next" token to train on
-                if info.offset + short_ctx_len >= len(info.sequence) - 1:
-                    info.ended = True
+                if info.was_backspace:
+                    # shift window back by one token
+                    info.offset -= 1
+                    info.was_backspace = False
                 else:
-                    # slide shortctx to include next token
-                    if not info.was_backspace:
-                        info.offset += 1
-                        # mark tokens seen
-                        info.new_mask[info.offset : info.offset + short_ctx_len] = [False] * short_ctx_len
+                    # check if sequence ended
+                    # we end one token before the last otherwise there is no "next" token to train on
+                    if info.offset + short_ctx_len >= len(info.sequence) - 1:
+                        info.ended = True
                     else:
-                        info.was_backspace = False
-                    self.halted_sequences.append(i)
+                        # slide shortctx to include next token
+                        info.offset += 1
 
         return ended_count
 
