@@ -1,13 +1,13 @@
 import json
-import re
 import warnings
 from collections.abc import Iterable
 
 import numpy as np
+import tqdm
 import zstandard
 from sentencepiece import SentencePieceProcessor
 
-END_PARAGRAPH = re.compile(r'\n(?:[-=~]*\n+)?')
+TOKENIZE_BATCH_SIZE = 128
 
 def load_dataset(in_stream):
     dctx = zstandard.ZstdDecompressor()
@@ -29,7 +29,7 @@ def load_dataset(in_stream):
         warnings.warn('dataset file did not end with newline')
 
 class SequenceProvider:
-    n_sequences: int
+    n_tokens: int
     states: list[Iterable[list[int]]]
     text_loader: Iterable[str]
     tokenizer: SentencePieceProcessor
@@ -42,84 +42,83 @@ class SequenceProvider:
     text_start_token: int
     text_end_token: int
 
+    buffered_tokens: int = 0
+    sequences: list[np.ndarray]
+    randgen: np.random.Generator
+
     def __init__(
         self,
-        n_sequences: int,
+        n_tokens: int,
         text_loader: Iterable[str],
         tokenizer: SentencePieceProcessor,
         short_ctx_len: int,
         target_seq_len: int,
+        randseed: np.random.SeedSequence | None = None,
     ):
-        self.n_sequences = n_sequences
         self.text_loader = text_loader
         self.tokenizer = tokenizer
         self.short_ctx_len = short_ctx_len
         self.target_seq_len = target_seq_len
-        self.states = [None] * n_sequences
-        self.seq_len_high_threshold = int(target_seq_len * 1.1)
-        self.seq_len_low_threshold = int(target_seq_len * 0.8)
-        self.text_fragment_max_len = int(target_seq_len * 512)
+        self.n_tokens = n_tokens
 
         self.pad_token = self.tokenizer['<pad>']
         self.text_start_token = self.tokenizer['<s>']
         self.text_end_token = self.tokenizer['</s>']
 
+        self.sequences = []
+        self.randgen = np.random.default_rng(randseed)
+
     def next_document(self) -> str:
         try:
             return next(self.text_loader)
-        except StopIteration:
+        except StopIteration as exc:
             # TODO: deal with this somehow
-            raise RuntimeError('loader exhausted')
+            raise RuntimeError('loader exhausted') from exc
 
     def wrap_sequence(self, tokens: list[int]):
         pad_start = [self.pad_token] * (self.short_ctx_len - 1) + [self.text_start_token]
-        last = [self.text_end_token]
-        return pad_start + tokens + last
+        return pad_start + tokens
 
-    def make_sequence_slicer(self, text: str):
-        current_pos = 0
-        while len(text) - current_pos > 0:
-            tokens = self.tokenizer.Encode(
-                text[current_pos : current_pos + self.text_fragment_max_len]
-            )
-            if len(tokens) < self.seq_len_low_threshold:
-                if current_pos == 0:
-                    # send if it isn't something we've truncated
-                    yield self.wrap_sequence(tokens)
-                # otherwise discard
-                return
-
-            if len(tokens) < self.seq_len_high_threshold:
-                yield self.wrap_sequence(tokens)
-                return
-
-            should_continue = False
-            end_matches = END_PARAGRAPH.finditer(text, pos=current_pos)
-            for end_match in end_matches:
-                fragment = text[current_pos : end_match.start()]
-                tokens = self.tokenizer.Encode(fragment)
-                if len(tokens) < self.seq_len_low_threshold:
-                    # don't send a fragment that's too short
-                    continue
-
-                should_continue = True
-                current_pos = end_match.end()
-                yield self.wrap_sequence(tokens)
-                break
-
-            if not should_continue:
-                # either no paragraph separator or no good match
-                yield self.wrap_sequence(tokens)
-                return
-
+    # TODO: maybe return numpy or torch array instead?
     def next_sequence(self):
-        index = np.random.randint(0, len(self.states))
-        while True:
-            current = self.states[index]
-            try:
-                if current is None:
-                    raise StopIteration()
+        if len(self.sequences) == 0:
+            self.refresh()
 
-                return next(current)
-            except StopIteration:
-                self.states[index] = self.make_sequence_slicer(self.next_document())
+        return self.wrap_sequence(self.sequences.pop().tolist())
+
+    def refresh(self):
+        self.buffered_tokens = 0
+        self.sequences.clear()
+        sequences = self.sequences
+        pbar = tqdm.tqdm(
+            leave=False, disable=None, unit='token', total=self.n_tokens,
+            desc='reading sequences'
+        )
+
+        try:
+            # load sequences
+            while self.buffered_tokens < self.n_tokens:
+                batch = []
+                for _ in range(TOKENIZE_BATCH_SIZE):
+                    batch.append(self.next_document())
+                tokenized = self.tokenizer.Encode(batch)
+                for doc in tokenized:
+                    pos = 0
+                    while pos < len(doc):
+                        tokens = doc[pos : pos + self.target_seq_len]
+                        if len(tokens) < self.target_seq_len:
+                            tokens.append(self.text_end_token)
+
+                        self.buffered_tokens += len(tokens)
+                        sequences.append(np.array(tokens, dtype=np.uint16))
+                        pbar.update(self.buffered_tokens - pbar.n)
+                        pos += self.target_seq_len
+
+            pbar.close()
+        except:
+            # don't clear bar on error
+            pbar.leave = True
+            raise
+
+        # shuffle
+        self.randgen.shuffle(sequences)

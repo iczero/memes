@@ -5,7 +5,6 @@ import signal
 import sys
 
 import aim
-import numpy as np
 import torch
 import torch._dynamo.config
 import torch.nn.functional as F
@@ -491,8 +490,8 @@ class TrainHelper:
             DEBUG_RECURRENT_GRAD = []
 
     def adjust_confidence_stats(self):
-        self.train_config.prev_loss_mean = np.mean(self.prev_unweighted_losses).item()
-        self.train_config.prev_loss_std = np.std(self.prev_unweighted_losses).item()
+        self.train_config.prev_loss_mean = torch.mean(torch.tensor(self.prev_unweighted_losses, device='cpu')).item()
+        self.train_config.prev_loss_std = torch.std(torch.tensor(self.prev_unweighted_losses, device='cpu')).item()
         print(
             'adjust_confidence_stats: mean',
             self.train_config.prev_loss_mean,
@@ -577,7 +576,7 @@ def main():
 
     trainer.sequence_provider = SequenceProvider(
         # TODO: actually preprocess data or something
-        n_sequences=2048,
+        n_tokens=1 << 25, # 32M
         text_loader=filter_text(data_iter),
         tokenizer=tokenizer,
         short_ctx_len=model_config.short_ctx_len,
