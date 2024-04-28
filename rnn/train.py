@@ -115,7 +115,7 @@ class TrainBatch:
 
         return self.sequence_provider.next_sequence()
 
-    def next_batch(self):
+    def initialize_sequences(self):
         self.recurrent = self.model.make_recurrent_init() \
             .unsqueeze(0).repeat_interleave(self.batch_size, 0)
         self.sequences = [
@@ -123,6 +123,23 @@ class TrainBatch:
         ]
         self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
         self.halted_sequences = list(range(self.batch_size))
+
+    def load_next(self):
+        "Prepare for next batch"
+        self.recurrent = self.recurrent.detach()
+        ended = []
+        for i, info in enumerate(self.sequences):
+            if info.ended:
+                ended.append(i)
+            else:
+                info.losses.clear()
+                info.halted_losses.clear()
+                info.confidence_losses.clear()
+
+        for i in ended:
+            # new sequence for ended sequences
+            self.sequences[i] = TrainSequence(sequence=self.next_sequence())
+            self.recurrent[i].copy_(self.model.make_recurrent_init(), non_blocking=True)
 
     def prepare_batch(self):
         # prepare inputs and expected output
@@ -195,8 +212,7 @@ class TrainBatch:
         short_ctx: torch.Tensor,
         new_mask: torch.Tensor,
         expected_output: torch.Tensor,
-        # this value should not change during training
-        min_p_halt: float,
+        min_p_halt: torch.Tensor,
         p_not_halt: torch.Tensor,
         prev_loss_mean: torch.Tensor,
         prev_loss_std: torch.Tensor,
@@ -220,9 +236,9 @@ class TrainBatch:
         # p_halt_out does not need grad
         p_halt_out = F.sigmoid(confidence_out.detach() + self.model_config.ponder_adjust)
         # enforce min_p_halt when determining halt only
-        did_halt = torch.maximum(p_halt_out, torch.tensor(min_p_halt)).bernoulli() > 0
+        did_halt = torch.maximum(p_halt_out, min_p_halt).bernoulli() > 0
 
-        step_weight = p_halt_out ** 3
+        step_weight = p_halt_out ** 2.5
         # if halted, override to 1
         step_weight = torch.where(did_halt, 1., step_weight)
         weighted_losses = p_not_halt * step_weight * cross_entropy + confidence_losses
@@ -234,7 +250,7 @@ class TrainBatch:
         return next_recurrent, token_out, confidence_out, p_halt_out, \
             did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_next
 
-    def forward_step(self):
+    def forward_step(self, force_halt=False):
         short_ctx_len = self.model_config.short_ctx_len
         input_short_ctx, input_new_mask, expected_output = self.prepare_batch()
 
@@ -245,21 +261,23 @@ class TrainBatch:
                 input_short_ctx,
                 input_new_mask,
                 expected_output,
-                min_p_halt=self.train_config.min_p_halt,
-                p_not_halt=self.p_not_halt,
                 # prevent torch.compile from recompiling on change
+                min_p_halt=torch.tensor(
+                    self.train_config.min_p_halt if not force_halt else 1.,
+                    device=self.device,
+                    dtype=self.dtype
+                ),
+                p_not_halt=self.p_not_halt,
                 prev_loss_mean=torch.tensor(
                     self.train_config.prev_loss_mean,
-                    device='cpu',
+                    device=self.device,
                     dtype=self.dtype,
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True),
+                ),
                 prev_loss_std=torch.tensor(
                     self.train_config.prev_loss_std,
-                    device='cpu',
+                    device=self.device,
                     dtype=self.dtype,
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True),
+                ),
             )
 
         cross_entropy_cpu = cross_entropy.detach().to('cpu', non_blocking=True)
@@ -310,16 +328,6 @@ class TrainBatch:
                         info.backspace_gap -= 1
 
         return ended_count
-
-    def truncate_backprop(self):
-        "Detaches recurrent state and clears losses"
-        self.recurrent = self.recurrent.detach()
-        for info in self.sequences:
-            info.losses.clear()
-            info.halted_losses.clear()
-            info.confidence_losses.clear()
-            if info.prev_internal is not None:
-                info.prev_internal = info.prev_internal.detach()
 
     def iter_train_losses(self):
         for info in self.sequences:
@@ -442,11 +450,12 @@ class TrainHelper:
         return self.train_loss, self.unweighted_loss
 
     def step_single(self, batch: TrainBatch):
-        batch.next_batch()
+        batch.initialize_sequences()
 
         # forward step
-        for _ in range(self.train_config.truncate_steps):
-            done_count = batch.forward_step()
+        for i in range(self.train_config.truncate_steps):
+            is_last_step = i == self.train_config.truncate_steps - 1
+            done_count = batch.forward_step(force_halt=is_last_step)
             if done_count >= batch.batch_size:
                 break
 
@@ -464,8 +473,6 @@ class TrainHelper:
 
         # backward step
         train_loss.backward()
-        # safe to reset if not TBPTT
-        # batch.reset()
         # batch.truncate_backprop()
 
         global DEBUG_RECURRENT_GRAD
@@ -576,11 +583,11 @@ def main():
 
     trainer.sequence_provider = SequenceProvider(
         # TODO: actually preprocess data or something
-        n_tokens=1 << 25, # 32M
+        n_tokens=1 << 26, # 64M
         text_loader=filter_text(data_iter),
         tokenizer=tokenizer,
         short_ctx_len=model_config.short_ctx_len,
-        target_seq_len=train_config.truncate_steps,
+        target_seq_len=train_config.truncate_steps * 8,
     )
 
     model = trainer.model

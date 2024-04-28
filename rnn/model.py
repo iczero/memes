@@ -28,16 +28,16 @@ class PartialCrossAttention(nn.Module):
         )
         # https://arxiv.org/pdf/2110.09456.pdf
         # TODO: go make references section
-        self.head_scales = nn.Parameter(torch.zeros((config.n_attention_heads,)))
+        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
 
-    def forward(self, internal: torch.Tensor, external: torch.Tensor):
+    def forward(self, internal_norm: torch.Tensor, internal_resid: torch.Tensor, external_norm: torch.Tensor):
         # external is the other sequence concatenated to k/v, internal is our own sequence
         # q shape: (batch, seq, n_heads, n_embed)
         # transpose (batch, seq, n_heads, n_embed) -> (batch, n_heads, seq, n_embed) for sdp
-        q = self.q_linear(internal) \
+        q = self.q_linear(internal_norm) \
             .unflatten(-1, (self.n_attention_heads, self.n_embed)) \
             .transpose(-2, -3)
-        kv_seq = torch.concat((external, internal), dim=-2)
+        kv_seq = torch.concat((external_norm, internal_norm), dim=-2)
         # kv_merged shape: (batch, seq, 2, n_heads, n_embed)
         kv_merged = self.kv_linear(kv_seq).unflatten(-1, (2, self.n_attention_heads, self.n_embed))
         # extract from merged
@@ -49,10 +49,15 @@ class PartialCrossAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout_p)
 
         # transpose back
+        # -> (batch, seq, n_heads, n_embed)
         attn_out = attn_out.transpose(-2, -3)
 
+        # concat skip connection
+        # -> (batch, seq, n_heads + 1, n_embed)
+        attn_out = torch.cat((attn_out, internal_resid.unsqueeze(-2)), dim=-2)
+
         # scale heads
-        return attn_out + self.head_scales.unsqueeze(-1) * attn_out
+        return self.head_scales.unsqueeze(-1) * attn_out
 
 class GatedFeedForward(nn.Module):
     "Feedforward after attention with residual gating"
@@ -60,21 +65,20 @@ class GatedFeedForward(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.register_buffer('resid_gate_multiplier', torch.tensor(config.resid_gate_multiplier))
-        in_dim = config.n_embed * config.n_attention_heads
-        mid_dim = config.ff_dim_multiplier * config.n_embed
+        in_dim = config.n_embed * (config.n_attention_heads + 1)
         out_dim = config.n_embed + 1
-        # in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed)
+        # in: (batch, seq, n_heads + 1, n_embed) -> (batch, seq, (n_heads + 1) * n_embed)
         # out: residuals (batch, seq, n_embed) after gating
         # modified feedforward: dense after heads, then rescale back to n_embed
         self.stack = nn.Sequential(
             # concat all heads
             nn.Flatten(start_dim=-2, end_dim=-1),
-            nn.Linear(in_dim, mid_dim),
+            nn.Linear(in_dim, config.ff_inner_dim),
             config.get_activation(),
-            nn.Linear(mid_dim, mid_dim),
+            nn.Linear(config.ff_inner_dim, config.ff_inner_dim),
             config.get_activation(),
             nn.Dropout(config.ff_dropout_p),
-            nn.Linear(mid_dim, out_dim),
+            nn.Linear(config.ff_inner_dim, out_dim),
         )
 
     def forward(self, x):
@@ -99,6 +103,8 @@ class InputLayer(nn.Module):
         # in: (batch, seq)
         self.input_embedding = nn.Embedding(config.vocab_size, config.n_embed)
 
+        self.norm = nn.LayerNorm((config.n_embed,))
+
         # in: (batch, seq, n_embed)
         self.qkv_linear = nn.Linear(
             config.n_embed,
@@ -109,18 +115,19 @@ class InputLayer(nn.Module):
         # use rotary positional encoding
         self.rope = RotaryEncoding(config.n_embed, config.short_ctx_len)
 
+        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
+
         # no residuals in input layer
-        # ff in: (batch, seq, n_heads, n_embed) -> (batch, seq, n_heads * n_embed + 1)
+        # ff in: (batch, seq, n_heads + 1, n_embed) -> (batch, seq, (n_heads + 1) * n_embed + 1)
         # one more input for new_mask
-        ff_in_dim = config.n_embed * config.n_attention_heads + 1
-        ff_mid_dim = config.ff_dim_multiplier * config.n_embed
+        ff_in_dim = config.n_embed * (config.n_attention_heads + 1) + 1
         self.feedforward = nn.Sequential(
-            nn.Linear(ff_in_dim, ff_mid_dim),
+            nn.Linear(ff_in_dim, config.ff_inner_dim),
             config.get_activation(),
-            nn.Linear(ff_mid_dim, ff_mid_dim),
+            nn.Linear(config.ff_inner_dim, config.ff_inner_dim),
             config.get_activation(),
             nn.Dropout(config.ff_dropout_p),
-            nn.Linear(ff_mid_dim, config.n_embed),
+            nn.Linear(config.ff_inner_dim, config.n_embed),
         )
 
     def forward(self, tokens: torch.Tensor, new_mask: torch.Tensor):
@@ -130,7 +137,7 @@ class InputLayer(nn.Module):
         embeddings = self.input_embedding(tokens)
 
         # kv_merged shape: (batch, seq, 3 (q/k/v), n_heads, n_embed)
-        kv_merged = self.qkv_linear(embeddings) \
+        kv_merged = self.qkv_linear(self.norm(embeddings)) \
             .unflatten(-1, (3, self.n_attention_heads, self.n_embed))
         # extract from merged
         q = kv_merged[..., 0, :, :].transpose(-2, -3)
@@ -147,6 +154,10 @@ class InputLayer(nn.Module):
 
         # transpose back
         attn_out = attn_out.transpose(-2, -3)
+        # concat skip
+        attn_out = torch.cat((attn_out, embeddings.unsqueeze(-2)), dim=-2)
+        # scale heads
+        attn_out = self.head_scales.unsqueeze(-1) * attn_out
 
         # concat heads and add new token mark
         ff_in = torch.cat((
@@ -172,10 +183,10 @@ class IntermediateLayer(nn.Module):
         recurrent_norm = self.norm(recurrent)
         internal_norm = self.norm(internal)
 
-        recurrent_resid = self.recurrent_attention(recurrent_norm, internal_norm)
+        recurrent_resid = self.recurrent_attention(recurrent_norm, recurrent, internal_norm)
         recurrent_resid = self.recurrent_feedforward(recurrent_resid)
 
-        internal_resid = self.internal_attention(internal_norm, recurrent_norm)
+        internal_resid = self.internal_attention(internal_norm, internal, recurrent_norm)
         internal_resid = self.internal_feedforward(internal_resid)
 
         return recurrent + recurrent_resid, internal + internal_resid
@@ -204,9 +215,9 @@ class OutputDecode(nn.Module):
         )
 
         self.ff_out = nn.Sequential(
-            nn.Linear(config.n_embed, config.ff_dim_multiplier * config.n_embed),
+            nn.Linear(config.n_embed, config.ff_inner_dim),
             config.get_activation(),
-            nn.Linear(config.ff_dim_multiplier * config.n_embed, config.n_embed),
+            nn.Linear(config.ff_inner_dim, config.n_embed),
             nn.Linear(config.n_embed, config.vocab_size),
         )
 

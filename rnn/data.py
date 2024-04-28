@@ -95,6 +95,7 @@ class SequenceProvider:
             desc='reading sequences'
         )
 
+        doc_count = 0
         try:
             # load sequences
             while self.buffered_tokens < self.n_tokens:
@@ -103,6 +104,7 @@ class SequenceProvider:
                     batch.append(self.next_document())
                 tokenized = self.tokenizer.Encode(batch)
                 for doc in tokenized:
+                    doc_count += 1
                     pos = 0
                     while pos < len(doc):
                         tokens = doc[pos : pos + self.target_seq_len]
@@ -115,6 +117,7 @@ class SequenceProvider:
                         pos += self.target_seq_len
 
             pbar.close()
+            print(f'loaded {doc_count} documents, {self.buffered_tokens} tokens')
         except:
             # don't clear bar on error
             pbar.leave = True
@@ -122,3 +125,6 @@ class SequenceProvider:
 
         # shuffle
         self.randgen.shuffle(sequences)
+
+if __name__ == '__main__':
+    pass

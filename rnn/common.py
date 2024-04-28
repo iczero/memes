@@ -27,8 +27,8 @@ class ModelConfig:
     "Number of intermediate layers"
     resid_gate_multiplier: float
     "Multiplier for residual gating"
-    ff_dim_multiplier: int
-    "Size of feedforward inner dimensions, as ff_dim_multiplier * n_embed"
+    ff_inner_dim: int
+    "Size of feedforward inner dimension (usually 4 * n_embed)"
     activation: str
     "Activation function"
     dtype: str
@@ -61,7 +61,7 @@ class ModelConfig:
             attn_dropout_p=float(obj['attn_dropout_p']),
             n_intermediate=int(obj['n_intermediate']),
             resid_gate_multiplier=float(obj['resid_gate_multiplier']),
-            ff_dim_multiplier=int(obj['ff_dim_multiplier']),
+            ff_inner_dim=int(obj['ff_inner_dim']),
             activation=str(obj['activation']),
             dtype=str(obj['dtype']),
             qkv_bias=bool(obj['qkv_bias']),
@@ -97,7 +97,8 @@ class TrainConfig:
     batch_size: int
     "Batch size"
     truncate_steps: int
-    "Max sequence length during training. Truncated BPTT didn't work and was removed"
+    "Max backpropagation sequence length during training"
+    # TODO: limit max train sequence length
     accumulate_gradients: int
     "How many batches to run before running the optimizer step"
     clip_grad_norm: float
