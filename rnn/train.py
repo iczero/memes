@@ -3,6 +3,7 @@ import datetime
 import json
 import signal
 import sys
+from typing import Any
 
 import aim
 import torch
@@ -11,9 +12,12 @@ import torch.nn.functional as F
 from sentencepiece import SentencePieceProcessor
 from torch import nn
 
-from .common import ModelConfig, TrainConfig, random_token_not
-from .data import SequenceProvider, load_dataset
+from .common import ModelConfig, TrainConfig
+from .data import filter_text, load_dataset
 from .model import RNNSequence
+
+# TODO: types hack
+SequenceProvider = Any
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
@@ -39,6 +43,13 @@ def confidence_loss(
         target_confidence,
         reduction='none'
     )
+
+def random_token_not(total: int, not_token: int):
+    "Generate a random token id that is not the provided token"
+    while True:
+        token = torch.randint(0, total, tuple()).item()
+        if token != not_token:
+            return token
 
 @dataclasses.dataclass
 class TrainSequence:
@@ -110,9 +121,6 @@ class TrainBatch:
         self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
 
     def next_sequence(self) -> list[int]:
-        if self.sequence_provider is None:
-            raise RuntimeError('sequence_provider not provided')
-
         return self.sequence_provider.next_sequence()
 
     def initialize_sequences(self):
@@ -124,22 +132,13 @@ class TrainBatch:
         self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
         self.halted_sequences = list(range(self.batch_size))
 
-    def load_next(self):
+    def detach_all(self):
         "Prepare for next batch"
         self.recurrent = self.recurrent.detach()
-        ended = []
-        for i, info in enumerate(self.sequences):
-            if info.ended:
-                ended.append(i)
-            else:
-                info.losses.clear()
-                info.halted_losses.clear()
-                info.confidence_losses.clear()
-
-        for i in ended:
-            # new sequence for ended sequences
-            self.sequences[i] = TrainSequence(sequence=self.next_sequence())
-            self.recurrent[i].copy_(self.model.make_recurrent_init(), non_blocking=True)
+        for info in self.sequences:
+            info.losses.clear()
+            info.halted_losses.clear()
+            info.confidence_losses.clear()
 
     def prepare_batch(self):
         # prepare inputs and expected output
@@ -319,6 +318,7 @@ class TrainBatch:
                     # we end one token before the last otherwise there is no "next" token to train on
                     if info.offset + short_ctx_len >= len(info.sequence) - 1:
                         info.ended = True
+                        ended_count += 1
                     else:
                         # slide shortctx to include next token
                         info.offset += 1
@@ -423,6 +423,7 @@ class TrainHelper:
                 batch_size=self.train_config.batch_size,
                 sequence_provider=self.sequence_provider,
             )
+            batch.initialize_sequences()
             self.batches.append(batch)
 
     def track(
@@ -450,13 +451,13 @@ class TrainHelper:
         return self.train_loss, self.unweighted_loss
 
     def step_single(self, batch: TrainBatch):
-        batch.initialize_sequences()
-
-        # forward step
+        # forward step TODO:
+        should_new_seq = True
         for i in range(self.train_config.truncate_steps):
             is_last_step = i == self.train_config.truncate_steps - 1
             done_count = batch.forward_step(force_halt=is_last_step)
-            if done_count >= batch.batch_size:
+            if done_count >= batch.batch_size / 2:
+                should_new_seq = True
                 break
 
         # run loss
@@ -473,7 +474,14 @@ class TrainHelper:
 
         # backward step
         train_loss.backward()
-        # batch.truncate_backprop()
+
+        if should_new_seq:
+            # if enough sequences have ended, get new ones
+            print('(ns)', end='')
+            batch.initialize_sequences()
+        else:
+            # continue with current sequences
+            batch.detach_all()
 
         global DEBUG_RECURRENT_GRAD
         if isinstance(DEBUG_RECURRENT_GRAD, list):
@@ -568,27 +576,24 @@ def main():
         print('unknown subcommand:', subcommand)
         return
 
-    data_file = open(data_path, 'rb')
-    data_iter = load_dataset(data_file)
+    # TODO: temp hack
+    data_iter = filter_text(load_dataset(open(data_path, 'rb')))
 
-    def filter_text(data):
-        for _count, set_name, text in data:
-            if set_name not in (
-                'BookCorpus2', 'Books3', 'Enron Emails', 'Gutenberg (PG-19)',
-                'HackerNews', 'OpenWebText2', 'Ubuntu IRC', 'Wikipedia (en)'
-            ):
-                continue
+    class TempSeqProvider:
+        def __init__(self):
+            self.pad_token = tokenizer['<pad>']
+            self.text_start_token = tokenizer['<s>']
 
-            yield text
+        def wrap_sequence(self, tokens: list[int]):
+            pad_start = [self.pad_token] * (model_config.short_ctx_len - 1) + [self.text_start_token]
+            return pad_start + tokens
 
-    trainer.sequence_provider = SequenceProvider(
-        # TODO: actually preprocess data or something
-        n_tokens=1 << 26, # 64M
-        text_loader=filter_text(data_iter),
-        tokenizer=tokenizer,
-        short_ctx_len=model_config.short_ctx_len,
-        target_seq_len=train_config.truncate_steps * 8,
-    )
+        def next_sequence(self):
+            document = next(data_iter)
+            encoded = self.wrap_sequence(tokenizer.Encode(document))[:train_config.max_seq_len]
+            return encoded
+
+    trainer.sequence_provider = TempSeqProvider()
 
     model = trainer.model
     optimizer = train_config.make_optimizer(

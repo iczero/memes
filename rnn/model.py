@@ -54,7 +54,7 @@ class PartialCrossAttention(nn.Module):
 
         # concat skip connection
         # -> (batch, seq, n_heads + 1, n_embed)
-        attn_out = torch.cat((attn_out, internal_resid.unsqueeze(-2)), dim=-2)
+        attn_out = torch.cat((attn_out, internal_norm.unsqueeze(-2)), dim=-2)
 
         # scale heads
         return self.head_scales.unsqueeze(-1) * attn_out

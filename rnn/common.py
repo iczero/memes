@@ -98,7 +98,8 @@ class TrainConfig:
     "Batch size"
     truncate_steps: int
     "Max backpropagation sequence length during training"
-    # TODO: limit max train sequence length
+    max_seq_len: int
+    "Max sequence length during training"
     accumulate_gradients: int
     "How many batches to run before running the optimizer step"
     clip_grad_norm: float
@@ -127,6 +128,7 @@ class TrainConfig:
             backspace_p=float(obj['backspace_p']),
             batch_size=int(obj['batch_size']),
             truncate_steps=int(obj['truncate_steps']),
+            max_seq_len=int(obj['max_seq_len']),
             clip_grad_norm=float(obj['clip_grad_norm']),
             optimizer=str(obj['optimizer']),
             min_p_halt=float(obj['min_p_halt']),
@@ -174,13 +176,6 @@ class TrainConfig:
             )
 
         raise RuntimeError('unknown optimizer ' + self.optimizer)
-
-def random_token_not(total: int, not_token: int):
-    "Generate a random token id that is not the provided token"
-    while True:
-        token = torch.randint(0, total, tuple()).item()
-        if token != not_token:
-            return token
 
 # why doesn't safetensors support loading metadata?
 def safetensors_load_metadata(filename):
