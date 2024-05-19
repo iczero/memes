@@ -1,0 +1,5 @@
+- scaled dot product attention: <https://arxiv.org/pdf/1706.03762v7>
+- layer normalization position: <https://arxiv.org/pdf/2002.04745>
+- consistency LLMs: <https://arxiv.org/abs/2403.00835>
+- headscale: <https://arxiv.org/pdf/2110.09456.pdf>
+- jacobi decoding: <https://arxiv.org/abs/2305.10427>

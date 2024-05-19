@@ -9,16 +9,14 @@ from torch import nn
 
 @dataclasses.dataclass
 class ModelConfig:
-    n_embed: int
+    d_embed: int
     "Embedding dimensions"
     n_attention_heads: int
     "Number of attention heads"
     vocab_size: int
     "Vocabulary size"
-    short_ctx_len: int
-    "Length of input short context sequence"
-    recurrent_seq_len: int
-    "Length of recurrent sequence"
+    n_streams: int
+    "Number of streams"
     ff_dropout_p: float
     "Probability of dropout after feedforward"
     attn_dropout_p: float
@@ -27,7 +25,7 @@ class ModelConfig:
     "Number of intermediate layers"
     resid_gate_multiplier: float
     "Multiplier for residual gating"
-    ff_inner_dim: int
+    d_ff_inner: int
     "Size of feedforward inner dimension (usually 4 * n_embed)"
     activation: str
     "Activation function"
@@ -35,38 +33,29 @@ class ModelConfig:
     "Data type of model"
     qkv_bias: bool
     "Whether Q/K/V linear layers in attention should have bias"
-    tokenizer_model_path: str
-    "Path to the tokenizer model"
-    ponder_adjust: float
-    "Offset for p_halt from center"
 
     def __post_init__(self):
-        assert self.n_embed > 0
+        assert self.d_embed > 0
         assert self.n_attention_heads > 0
         assert self.vocab_size > 0
-        assert self.short_ctx_len > 0
-        assert self.recurrent_seq_len > 0
         assert self.ff_dropout_p >= 0
         assert self.resid_gate_multiplier > 0
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
         return cls(
-            n_embed=int(obj['n_embed']),
+            d_embed=int(obj['d_embed']),
             n_attention_heads=int(obj['n_attention_heads']),
             vocab_size=int(obj['vocab_size']),
-            short_ctx_len=int(obj['short_ctx_len']),
-            recurrent_seq_len=int(obj['recurrent_seq_len']),
+            n_streams=int(obj['n_streams']),
             ff_dropout_p=float(obj['ff_dropout_p']),
             attn_dropout_p=float(obj['attn_dropout_p']),
             n_intermediate=int(obj['n_intermediate']),
             resid_gate_multiplier=float(obj['resid_gate_multiplier']),
-            ff_inner_dim=int(obj['ff_inner_dim']),
+            d_ff_inner=int(obj['d_ff_inner']),
             activation=str(obj['activation']),
             dtype=str(obj['dtype']),
             qkv_bias=bool(obj['qkv_bias']),
-            tokenizer_model_path=str(obj['tokenizer_model_path']),
-            ponder_adjust=float(obj['ponder_adjust']),
         )
 
     def to_dict(self):
@@ -79,6 +68,8 @@ class ModelConfig:
             return nn.ReLU()
         if self.activation == 'leakyrelu':
             return nn.LeakyReLU()
+
+        raise RuntimeError('unknown activation')
 
     def get_dtype(self):
         return {

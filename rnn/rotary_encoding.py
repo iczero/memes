@@ -36,6 +36,8 @@ def rotary_encoding_forward(cos_cached: torch.Tensor, sin_cached: torch.Tensor, 
     # in: (batch..., seq, n_embed)
     a = x[..., 0::2]
     b = x[..., 1::2]
-    a2 = cos_cached * a + sin_cached * -b
-    b2 = sin_cached * a + cos_cached * b
+    cos_resized = cos_cached.narrow(-2, 0, a.shape[-2])
+    sin_resized = sin_cached.narrow(-2, 0, a.shape[-2])
+    a2 = cos_resized * a + sin_resized * -b
+    b2 = sin_resized * a + cos_resized * b
     return torch.stack((a2, b2), dim=-1).flatten(-2, -1)
