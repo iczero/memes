@@ -49,22 +49,39 @@ class BatchLinear(nn.Module):
 
         return x
 
-# TODO: test encoder, needs additional modifications
-class Encoder(nn.Module):
+class BatchGLU(nn.Module):
+    def __init__(self, n_streams: int, d_in: int, d_mid: int, d_out: int, activation, has_bias = True):
+        super().__init__()
+        self.d_mid = d_mid
+        self.w_in = BatchLinear(n_streams, d_in, d_mid * 2, has_bias=has_bias)
+        self.activation = activation
+        self.w_out = BatchLinear(n_streams, d_mid, d_out, has_bias=has_bias)
+
+    def forward(self, x: torch.Tensor):
+        mid_1, mid_2 = self.w_in(x).split(self.d_mid, dim=-1)
+        mid = self.activation(mid_1) * mid_2
+        return self.w_out(mid)
+
+def apply_inline_gate(x: torch.Tensor, gate_multiplier: float):
+    # (..., d_embed + 1) -> (..., d_embed)
+    resid_gate = F.sigmoid(x[..., -1]) * gate_multiplier
+    return x[..., :-1] * resid_gate.unsqueeze(-1)
+
+class CrossAttentionInput(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_embed = config.d_embed
         self.n_attention_heads = config.n_attention_heads
-        self.d_ff_inner = config.d_ff_inner
-        self.activation = config.get_activation()
+        self.resid_gate_multiplier = config.resid_gate_multiplier
 
         self.input_embedding = nn.Embedding(config.vocab_size, config.d_embed, dtype=config.dtype)
         # marker for uncommitted
-        # self.uncommited_marker = nn.Parameter(torch.randn((config.d_embed,)))
-        # self.norm = nn.LayerNorm((config.d_embed))
-        self.init_q = nn.Parameter(
-            # (n_heads, stream, n_embed)
-            torch.randn((config.n_attention_heads, config.n_streams, config.d_embed))
+        self.uncommited_marker = nn.Parameter(torch.randn((config.d_embed,)))
+        self.norm = nn.LayerNorm((config.d_embed))
+        self.q_linear = BatchLinear(
+            config.n_streams,
+            config.d_embed,
+            config.n_attention_heads * config.d_embed
         )
         self.rope = RotaryEncoding(config.d_embed, config.n_streams)
         self.kv_linear = nn.Linear(
@@ -72,36 +89,51 @@ class Encoder(nn.Module):
             2 * config.n_attention_heads * config.d_embed,
             bias=config.qkv_bias,
         )
-        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads,)))
+        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
 
-        ff_in_dim = config.d_embed * config.n_attention_heads
-        self.ff_in = BatchLinear(config.n_streams, ff_in_dim, config.d_ff_inner * 2)
-        self.ff_out = BatchLinear(config.n_streams, config.d_ff_inner, config.d_embed)
+        ff_in_dim = config.d_embed * (config.n_attention_heads + 1)
+        self.feedforward = BatchGLU(
+            n_streams=config.n_streams,
+            d_in=ff_in_dim,
+            d_mid=config.d_ff_inner,
+            d_out=config.d_embed + 1,
+            activation=config.get_activation(),
+        )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, current: torch.Tensor, inputs: torch.Tensor, uncommitted: torch.Tensor):
         # (batch, stream) -> (batch, stream, d_embed)
-        embed = self.input_embedding(x)
-        # apply rotary embedding to tokens directly
-        embed = self.rope(embed)
+        inputs = self.input_embedding(inputs)
+        # mark uncommitted positions
+        inputs += torch.where(uncommitted.unsqueeze(-1), self.uncommited_marker, 0)
+        # apply rotary embedding to byte embeddings directly
+        inputs = self.rope(inputs)
 
-        # embed = self.norm(embed)
+        q = self.q_linear(self.norm(current)) \
+            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
+            .transpose(-2, -3)
         # -> (batch, stream, 2 (k/v), n_heads, d_embed)
-        kv_merged = self.kv_linear(embed) \
+        kv_merged = self.kv_linear(inputs) \
             .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
-        q = self.init_q
         k = kv_merged[..., 0, :, :].transpose(-2, -3)
         v = kv_merged[..., 1, :, :].transpose(-2, -3)
 
         # -> (batch, stream, n_heads, d_embed)
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
-        attn_concat = attn_out.flatten(-2, -1)
-        # ff_in: (batch, stream, n_heads * d_embed)
-        ff_mid_1, ff_mid_2 = self.ff_in(attn_concat).split(self.d_ff_inner, dim=-1)
-        ff_mid = self.activation(ff_mid_1) * ff_mid_2
-        ff_out = self.ff_out(ff_mid)
+        # add skip
+        attn_out = torch.cat((attn_out, current.unsqueeze(-2)), dim=-2)
+        # scale heads
+        attn_out = self.head_scales.unsqueeze(-1) * attn_out
 
-        return ff_out
+        attn_concat = attn_out.flatten(-2, -1)
+        # attn_concat: (batch, stream, n_heads * d_embed + 1)
+        ff_out = self.feedforward(attn_concat)
+
+        resid = apply_inline_gate(ff_out, self.resid_gate_multiplier)
+        return resid
+    
+class PreOutput(nn.Module):
+    pass
 
 class Decoder(nn.Module):
     def __init__(self, config: ModelConfig):

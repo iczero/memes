@@ -166,6 +166,14 @@ class TrainConfig:
                 weight_decay=self.weight_decay,
             )
 
+        if self.optimizer == 'NAdamW':
+            return torch.optim.NAdam(
+                groups,
+                self.lr,
+                weight_decay=self.weight_decay,
+                decoupled_weight_decay=True,
+            )
+
         raise RuntimeError('unknown optimizer ' + self.optimizer)
 
 # why doesn't safetensors support loading metadata?

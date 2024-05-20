@@ -3,3 +3,4 @@
 - consistency LLMs: <https://arxiv.org/abs/2403.00835>
 - headscale: <https://arxiv.org/pdf/2110.09456.pdf>
 - jacobi decoding: <https://arxiv.org/abs/2305.10427>
+- perceiver IO: <https://arxiv.org/pdf/2107.14795>
