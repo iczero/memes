@@ -7,6 +7,17 @@ from typing import Self
 import torch
 from torch import nn
 
+@enum.verify(enum.CONTINUOUS)
+class ControlTokens(enum.IntEnum):
+    # 0 to 255 are for byte values
+    PAD = 256
+    "Padding token used for input"
+    EMPTY = 257
+    "Token used to initialize output positions"
+    START_OF_TEXT = 258
+    "Start of text token"
+    END_OF_TEXT = 259
+    "End of text token"
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -14,8 +25,6 @@ class ModelConfig:
     "Embedding dimensions"
     n_attention_heads: int
     "Number of attention heads"
-    vocab_size: int
-    "Vocabulary size"
     n_streams: int
     "Number of streams"
     # TODO: dropout is not currently implemented
@@ -39,6 +48,8 @@ class ModelConfig:
     "Length of input short context"
     out_ctx_len: int
     "Length of output buffer"
+    vocab_size: int = 256 + len(ControlTokens)
+    "Vocabulary size"
 
     def __post_init__(self):
         assert self.d_embed > 0
@@ -173,15 +184,3 @@ def safetensors_load_metadata(filename):
         meta_len, = struct.unpack('<Q', meta_len_b)
         meta_dict = json.loads(f.read(meta_len))
         return meta_dict['__metadata__']
-
-@enum.verify(enum.CONTINUOUS)
-class ControlTokens(enum.IntEnum):
-    # 0 to 255 are for byte values
-    PAD = 256
-    "Padding token used for input"
-    EMPTY = 257
-    "Token used to initialize output positions"
-    START_OF_TEXT = 258
-    "Start of text token"
-    END_OF_TEXT = 259
-    "End of text token"

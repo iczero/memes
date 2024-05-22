@@ -15,7 +15,7 @@ class GLU(nn.Module):
         self.w = nn.Linear(in_dim, out_dim * 2, bias=bias)
 
     def forward(self, x: torch.Tensor):
-        w1, w2 = self.w(x).split(self.out_dim)
+        w1, w2 = self.w(x).split(self.out_dim, dim=-1)
         return w1 * self.activation(w2)
 
 class BatchLinear(nn.Module):
@@ -45,7 +45,7 @@ class BatchLinear(nn.Module):
         x = torch.bmm(x.transpose(-2, -3), self.weight.mT).transpose(-2, -3)
         if self.has_bias:
             # add bias (broadcasted): (batch, stream, d_embed) + (1, stream, d_embed)
-            x += self.bias
+            x = x + self.bias
 
         return x
 
@@ -74,7 +74,7 @@ class CrossAttentionInput(nn.Module):
         self.n_attention_heads = config.n_attention_heads
         self.resid_gate_multiplier = config.resid_gate_multiplier
 
-        self.input_embedding = nn.Embedding(config.vocab_size, config.d_embed, dtype=config.dtype)
+        self.input_embedding = nn.Embedding(config.vocab_size, config.d_embed)
         # marker for uncommitted
         self.uncommited_marker = nn.Parameter(torch.randn((config.d_embed,)))
         self.norm = nn.LayerNorm((config.d_embed))
@@ -105,7 +105,7 @@ class CrossAttentionInput(nn.Module):
         # (batch, stream) -> (batch, stream, d_embed)
         inputs = self.input_embedding(inputs)
         # mark uncommitted positions
-        inputs += torch.where(uncommitted.unsqueeze(-1), self.uncommited_marker, 0)
+        inputs = inputs + torch.where(uncommitted.unsqueeze(-1), self.uncommited_marker, 0)
         # apply rotary embedding to byte embeddings directly
         inputs = self.rope(inputs)
 
@@ -224,14 +224,14 @@ class PreOutput(nn.Module):
             .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
             .transpose(-2, -3)
         kv_merged = self.kv_linear(x_norm) \
-            .unflatten(-1, (self.n_attention_heads, self.d_embed))
+            .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
         k = kv_merged[..., 0, :, :].transpose(-2, -3)
         v = kv_merged[..., 1, :, :].transpose(-2, -3)
 
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
         # scale heads
-        attn_out = self.head_scales.squeeze(-1) * attn_out
+        attn_out = self.head_scales.unsqueeze(-1) * attn_out
         attn_concat = attn_out.flatten(-2, -1)
         ff_out = self.feedforward(attn_concat)
         return ff_out
@@ -280,9 +280,9 @@ class RNN(nn.Module):
         inputs_uncommitted: torch.Tensor,
         output_count: int,
     ):
-        recurrent += self.input(recurrent, inputs, inputs_uncommitted)
+        recurrent = recurrent + self.input(recurrent, inputs, inputs_uncommitted)
         for layer in self.intermediate:
-            recurrent += layer(recurrent)
+            recurrent = recurrent + layer(recurrent)
 
         output = self.pre_output(recurrent)
         tokens_out, logits_out = self.char_decode(output, output_count)
