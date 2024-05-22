@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import json
 import struct
 from typing import Self
@@ -17,6 +18,7 @@ class ModelConfig:
     "Vocabulary size"
     n_streams: int
     "Number of streams"
+    # TODO: dropout is not currently implemented
     ff_dropout_p: float
     "Probability of dropout after feedforward"
     attn_dropout_p: float
@@ -33,6 +35,10 @@ class ModelConfig:
     "Data type of model"
     qkv_bias: bool
     "Whether Q/K/V linear layers in attention should have bias"
+    short_ctx_len: int
+    "Length of input short context"
+    out_ctx_len: int
+    "Length of output buffer"
 
     def __post_init__(self):
         assert self.d_embed > 0
@@ -56,6 +62,8 @@ class ModelConfig:
             activation=str(obj['activation']),
             dtype=str(obj['dtype']),
             qkv_bias=bool(obj['qkv_bias']),
+            short_ctx_len=int(obj['short_ctx_len']),
+            out_ctx_len=int(obj['out_ctx_len']),
         )
 
     def to_dict(self):
@@ -83,49 +91,31 @@ class TrainConfig:
     "Learning rate"
     weight_decay: float
     "Weight decay"
-    backspace_p: float
-    "Probability to introduce bad token and backspace"
     batch_size: int
     "Batch size"
     truncate_steps: int
     "Max backpropagation sequence length during training"
-    max_seq_len: int
-    "Max sequence length during training"
+    # max_seq_len: int
+    # "Max sequence length during training"
     accumulate_gradients: int
     "How many batches to run before running the optimizer step"
     clip_grad_norm: float
     "Norm for gradient clipping"
     optimizer: str
     "Optimizer to use"
-    min_p_halt: float
-    "Lower bound for p_halt during training"
-    confidence_scale: float
-    "Scale factor for confidence loss when computing total loss"
-    prev_loss_mean: float
-    "Running mean of loss, for use in confidence"
-    prev_loss_std: float
-    "Running standard deviation of loss, for use in confidence"
     short_ctx_dropout_p: float
-    """
-    Probability to drop an input token from the short context
-    (excluding the last, which is never dropped)
-    """
+    "Probability to drop an input token from the short context"
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
         return cls(
             lr=float(obj['lr']),
             weight_decay=float(obj['weight_decay']),
-            backspace_p=float(obj['backspace_p']),
             batch_size=int(obj['batch_size']),
             truncate_steps=int(obj['truncate_steps']),
-            max_seq_len=int(obj['max_seq_len']),
+            # max_seq_len=int(obj['max_seq_len']),
             clip_grad_norm=float(obj['clip_grad_norm']),
             optimizer=str(obj['optimizer']),
-            min_p_halt=float(obj['min_p_halt']),
-            confidence_scale=float(obj['confidence_scale']),
-            prev_loss_mean=float(obj['prev_loss_mean']),
-            prev_loss_std=float(obj['prev_loss_std']),
             accumulate_gradients=int(obj['accumulate_gradients']),
             short_ctx_dropout_p=float(obj['short_ctx_dropout_p']),
         )
@@ -183,3 +173,15 @@ def safetensors_load_metadata(filename):
         meta_len, = struct.unpack('<Q', meta_len_b)
         meta_dict = json.loads(f.read(meta_len))
         return meta_dict['__metadata__']
+
+@enum.verify(enum.CONTINUOUS)
+class ControlTokens(enum.IntEnum):
+    # 0 to 255 are for byte values
+    PAD = 256
+    "Padding token used for input"
+    EMPTY = 257
+    "Token used to initialize output positions"
+    START_OF_TEXT = 258
+    "Start of text token"
+    END_OF_TEXT = 259
+    "End of text token"

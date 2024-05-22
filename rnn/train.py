@@ -3,76 +3,56 @@ import datetime
 import json
 import signal
 import sys
-from typing import Any
 
 import aim
 import torch
 import torch._dynamo.config
 import torch.nn.functional as F
-from sentencepiece import SentencePieceProcessor
 from torch import nn
 
-from .common import ModelConfig, TrainConfig
-from .data import filter_text, load_dataset
-from .model import RNNSequence
-
-# TODO: types hack
-SequenceProvider = Any
+from .common import ControlTokens, ModelConfig, TrainConfig
+from .data import load_dataset
+from .model import RNN
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
 
-# extreme hack
-DEBUG_RECURRENT_GRAD: list[torch.Tensor] | None = None
+# extreme hack (temporarily permanent)
+DEBUG_RECURRENT_GRAD: list[torch.Tensor] | bool | None = None
 def signal_grad_debug(*_args):
     global DEBUG_RECURRENT_GRAD
     DEBUG_RECURRENT_GRAD = True
 signal.signal(signal.SIGUSR1, signal_grad_debug)
 
-def confidence_loss(
-    loss: torch.Tensor, confidence_logit: torch.Tensor,
-    prev_mean: torch.Tensor, prev_std: torch.Tensor,
-):
-    SQRT_2 = torch.sqrt(torch.tensor(2.))
-    # rescale loss to standard normal, negate for high loss -> low confidence
-    loss_normal = -(loss - prev_mean) / prev_std
-    # needs sqrt(2) due to normal/logistic regression cdf difference wrt. sigmoid/tanh
-    target_confidence = F.sigmoid(loss_normal * SQRT_2)
-    return F.binary_cross_entropy_with_logits(
-        confidence_logit,
-        target_confidence,
-        reduction='none'
-    )
+def batch_roll(data: torch.Tensor, shift_by: torch.Tensor) -> torch.Tensor:
+    """
+    Batched `torch.roll()`
 
-def random_token_not(total: int, not_token: int):
-    "Generate a random token id that is not the provided token"
-    while True:
-        token = torch.randint(0, total, tuple()).item()
-        if token != not_token:
-            return token
+    `batch`: (batch, stream, d_embed) \\
+    `shift_by`: (batch), torch.int64 \\
+    returns `batch` rolled "left" by `shift_by
+    """
+
+    roll_size = data.shape[-2]
+    # generate indices
+    index_range = torch.arange(roll_size)
+    # shift indices by shift_by, wrap around
+    shift_mask = (index_range.unsqueeze(0) + shift_by.unsqueeze(-1)) % roll_size
+    # broadcast shift_mask to fit data
+    shift_mask = shift_mask.unsqueeze(-1).expand(data.shape)
+    # do the roll
+    return torch.gather(data, -2, shift_mask)
 
 @dataclasses.dataclass
 class TrainSequence:
-    sequence: list[int]
-    "Token sequence"
+    sequence: bytes
+    "Byte sequence"
     offset: int = 0
-    "Current offset into the seqeuence"
-    prev_offset: int | None = None
-    "Previous offset"
+    "Current offset into the sequence"
     ended: bool = False
     "If the sequence has reached the end"
     losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
     "List of losses for all steps"
-    halted_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
-    "Unweighted cross entropy loss at the end of each halted step"
-    confidence_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
-    "History of confidence losses, for metrics"
-    backspace_placeholder: int | None = None
-    "If we are doing backspace, contains the bad replacement token"
-    backspace_gap: int = 4
-    "How many tokens to wait before doing backspace again"
-    prev_halted: bool = True
-    "If the previous step for this sequence halted"
 
 class TrainBatch:
     model_config: ModelConfig
@@ -80,65 +60,69 @@ class TrainBatch:
     device: torch.device
     dtype: torch.dtype
     sequences: list[TrainSequence]
-    model: RNNSequence
-    recurrent: torch.Tensor | None = None
-    tokenizer: SentencePieceProcessor
-    sequence_provider: SequenceProvider
-    halted_sequences: list[int]
-    "List of sequences by index which halted the last step"
+    model: RNN
+    recurrent: torch.Tensor
     batch_size: int
     "Size of this batch"
-    p_not_halt: torch.Tensor
-    "Running probability that all previous ponder steps have not halted"
-    # TODO: not anymore
+    prev_output_tokens: torch.Tensor
+    prev_shift: torch.Tensor
 
     def __init__(
         self,
-        model: RNNSequence,
+        model: RNN,
         model_config: ModelConfig,
         train_config: TrainConfig,
-        tokenizer: SentencePieceProcessor,
         device: torch.device,
         dtype: torch.dtype,
         batch_size: int,
-        sequence_provider: SequenceProvider,
     ):
         self.model_config = model_config
         self.train_config = train_config
         self.device = device
         self.dtype = dtype
-        self.tokenizer = tokenizer
         self.model = model
         self.batch_size = batch_size
-        self.sequence_provider = sequence_provider
 
-        self.pad_token = torch.tensor(tokenizer['<pad>'], dtype=torch.int64, device=self.device)
-        self.shortctx_dropout_mask = torch.tensor(
-            [train_config.short_ctx_dropout_p] * model_config.short_ctx_len,
+        self.shortctx_dropout_mask = torch.full(
+            (model_config.out_ctx_len,),
+            train_config.short_ctx_dropout_p,
             dtype=torch.float32,
             device=self.device,
         )
-        self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
 
-    def next_sequence(self) -> list[int]:
+        # ensure state exists
+        self.init_state()
+
+    def next_sequence(self) -> bytes:
         return self.sequence_provider.next_sequence()
 
+    def init_state(self):
+        "initialize internal state for new batch"
+        # initialize shift to the full output length so all are marked as new
+        self.prev_shift = torch.full(
+            (self.batch_size,),
+            self.model_config.out_ctx_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.prev_output_tokens = torch.zeros(
+            (self.batch_size, self.model_config.out_ctx_len, self.model_config.d_embed),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.recurrent = self.model.recurrent_init.unsqueeze(0).repeat_interleave(self.batch_size, 0)
+
     def initialize_sequences(self):
-        self.recurrent = self.model.make_recurrent_init() \
-            .unsqueeze(0).repeat_interleave(self.batch_size, 0)
+        self.init_state()
         self.sequences = [
             TrainSequence(sequence=self.next_sequence()) for _ in range(self.batch_size)
         ]
-        self.p_not_halt = torch.ones(self.batch_size, dtype=self.dtype, device=self.device)
-        self.halted_sequences = list(range(self.batch_size))
 
     def detach_all(self):
         "Prepare for next batch"
         self.recurrent = self.recurrent.detach()
         for info in self.sequences:
             info.losses.clear()
-            info.halted_losses.clear()
-            info.confidence_losses.clear()
 
     def prepare_batch(self):
         # prepare inputs and expected output
@@ -221,7 +205,7 @@ class TrainBatch:
             (self.shortctx_dropout_mask.bernoulli() > 0)
                 .unsqueeze(0)
                 .logical_and(new_mask.logical_not()),
-            self.pad_token,
+            ControlTokens.PAD,
             short_ctx,
         )
 
@@ -362,14 +346,11 @@ class TrainBatch:
             / self.train_config.confidence_scale
 
 class TrainHelper:
-    prev_unweighted_losses: list[float]
-    "List of previous unweighted losses for adjusting ponder_loss_penalty"
     aim_run: aim.Run | None = None
     "Aim run instance for run tracking"
     batches: list[TrainBatch]
     "List of all batches"
-    model: RNNSequence
-    tokenizer: SentencePieceProcessor
+    model: RNN
     model_config: ModelConfig
     train_config: TrainConfig
     device: torch.device
@@ -378,16 +359,11 @@ class TrainHelper:
 
     train_loss: float = 0.0
     "Train loss for current step"
-    unweighted_loss: float = 0.0
-    "Unweighted loss for current step"
-    ponder_adjust_lookback: int
-    "How many values to keep for calculating mean/variance for confidence"
 
     def __init__(
         self,
         model_config: ModelConfig,
         train_config: TrainConfig,
-        tokenizer: SentencePieceProcessor,
         device: torch.device,
         dtype: torch.dtype,
     ):
@@ -395,11 +371,10 @@ class TrainHelper:
         self.train_config = train_config
         self.device = device
         self.dtype = dtype
-        self.tokenizer = tokenizer
         self.sequence_provider = None
         self.prev_unweighted_losses = []
 
-        self.model = RNNSequence(model_config)
+        self.model = RNN(model_config)
         self.model.type(self.dtype)
         self.model.to(self.device)
         self.model.train()
@@ -417,7 +392,6 @@ class TrainHelper:
                 model=self.model,
                 model_config=self.model_config,
                 train_config=self.train_config,
-                tokenizer=self.tokenizer,
                 device=self.device,
                 dtype=self.dtype,
                 batch_size=self.train_config.batch_size,
@@ -429,26 +403,25 @@ class TrainHelper:
     def track(
         self,
         value,
-        name: str = None,
-        step: int = None,
-        epoch: int = None,
+        name: str | None = None,
+        step: int | None = None,
+        epoch: int | None = None,
         *,
-        context: dict = None
+        context: dict | None = None
     ) -> None:
         "Track stat with aim"
         if self.aim_run is not None:
-            self.aim_run.track(value, name, step, epoch, context=context)
+            self.aim_run.track(value, name, step, epoch, context=context) # type: ignore
 
     def step_all(self):
         self.train_loss = 0
-        self.unweighted_loss = 0
         print('batch: ', end='', flush=True)
         for i, batch in enumerate(self.batches):
             self.step_single(batch)
             print(i, end=' ', flush=True)
 
         print('done')
-        return self.train_loss, self.unweighted_loss
+        return self.train_loss
 
     def step_single(self, batch: TrainBatch):
         # forward step TODO:
@@ -465,12 +438,6 @@ class TrainHelper:
         train_losses = list(batch.iter_train_losses())
         train_loss = torch.stack(train_losses).sum() / seq_proportion
         self.train_loss += train_loss.item()
-
-        unweighted_losses = torch.stack(list(batch.iter_unweighted_losses()))
-        self.prev_unweighted_losses += unweighted_losses.tolist()
-        if len(self.prev_unweighted_losses) > self.ponder_adjust_lookback * 2:
-            self.prev_unweighted_losses = self.prev_unweighted_losses[self.ponder_adjust_lookback:]
-        self.unweighted_loss += (unweighted_losses.sum() / seq_proportion).item()
 
         # backward step
         train_loss.backward()
@@ -504,16 +471,6 @@ class TrainHelper:
         elif DEBUG_RECURRENT_GRAD is True:
             DEBUG_RECURRENT_GRAD = []
 
-    def adjust_confidence_stats(self):
-        self.train_config.prev_loss_mean = torch.mean(torch.tensor(self.prev_unweighted_losses, device='cpu')).item()
-        self.train_config.prev_loss_std = torch.std(torch.tensor(self.prev_unweighted_losses, device='cpu')).item()
-        print(
-            'adjust_confidence_stats: mean',
-            self.train_config.prev_loss_mean,
-            'std',
-            self.train_config.prev_loss_std,
-        )
-
 def main():
     device = torch.device('cuda')
     torch.set_float32_matmul_precision('high')
@@ -532,11 +489,9 @@ def main():
 
         model_config = ModelConfig.from_dict(init_config['model_config'])
         train_config = TrainConfig.from_dict(init_config['train_config'])
-        tokenizer = SentencePieceProcessor()
-        tokenizer.Init(model_file=model_config.tokenizer_model_path)
 
         dtype = model_config.get_dtype()
-        trainer = TrainHelper(model_config, train_config, tokenizer, device, dtype)
+        trainer = TrainHelper(model_config, train_config, device, dtype)
         trainer.aim_run = aim.Run()
         trainer.aim_run['model_config'] = model_config.to_dict()
         trainer.aim_run['train_config'] = train_config.to_dict()
@@ -548,10 +503,8 @@ def main():
         loaded = torch.load(checkpoint_path, map_location='cpu')
         model_config = ModelConfig.from_dict(loaded['model_config'])
         train_config = TrainConfig.from_dict(loaded['train_config'])
-        tokenizer = SentencePieceProcessor()
-        tokenizer.Init(model_file=model_config.tokenizer_model_path)
         trainer = TrainHelper(
-            model_config, train_config, tokenizer, device, model_config.get_dtype()
+            model_config, train_config, device, model_config.get_dtype()
         )
         print('loading model')
         trainer.model.load_state_dict(loaded['model_state'])
@@ -672,11 +625,6 @@ def main():
             print('the current optimizer step will be skipped')
         else:
             optimizer.step()
-
-        if step % 10 == 0 and len(trainer.prev_unweighted_losses) >= trainer.ponder_adjust_lookback:
-            trainer.adjust_confidence_stats()
-            trainer.track(trainer.train_config.prev_loss_mean, name='prev_loss_mean', step=step)
-            trainer.track(trainer.train_config.prev_loss_std, name='prev_loss_std', step=step)
 
         if (datetime.datetime.now() - last_checkpoint).total_seconds() > 3600 or checkpoint_now:
             checkpoint_now = False

@@ -242,7 +242,7 @@ class CharDecode(nn.Module):
         self.d_embed = config.d_embed
         self.query_base = nn.Parameter(torch.randn((config.d_embed,)))
         self.rope = RotaryEncoding(config.d_embed, 128)
-        self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2)
+        self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2, bias=config.qkv_bias)
 
         self.feedforward = GLU(config.d_embed, config.d_embed, config.get_activation())
         self.w_out = nn.Linear(config.d_embed, config.vocab_size)
