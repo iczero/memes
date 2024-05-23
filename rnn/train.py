@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .common import ControlTokens, ModelConfig, TrainConfig
-from .data import load_dataset
+from .data import SequenceProvider, filter_text, load_dataset
 from .model import RNN
 
 DISABLE_TORCH_COMPILE = False
@@ -45,7 +45,7 @@ def batch_roll(data: torch.Tensor, shift_by: torch.Tensor) -> torch.Tensor:
 
 @dataclasses.dataclass
 class TrainSequence:
-    sequence: bytes
+    sequence: list[int]
     "Byte sequence"
     offset: int = 0
     "Current offset into the sequence"
@@ -53,6 +53,8 @@ class TrainSequence:
     "If the sequence has reached the end"
     losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
     "List of losses for all steps"
+    unweighted_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    "List of losses for all steps before distance weighting, but after temporal weighting"
 
 class TrainBatch:
     model_config: ModelConfig
@@ -64,8 +66,15 @@ class TrainBatch:
     recurrent: torch.Tensor
     batch_size: int
     "Size of this batch"
+    prev_output_embeddings: torch.Tensor
+    "Embedding vectors (before decode) from previous step"
     prev_output_tokens: torch.Tensor
-    prev_shift: torch.Tensor
+    "Concrete tokens (after decode) from previous step"
+    prev_shifts: torch.Tensor
+    "Shift from previous step"
+    sequence_provider: SequenceProvider
+    advance_rate: list[float]
+    "Averages of advance rate in characters per step"
 
     def __init__(
         self,
@@ -75,6 +84,7 @@ class TrainBatch:
         device: torch.device,
         dtype: torch.dtype,
         batch_size: int,
+        sequence_provider: SequenceProvider,
     ):
         self.model_config = model_config
         self.train_config = train_config
@@ -82,32 +92,39 @@ class TrainBatch:
         self.dtype = dtype
         self.model = model
         self.batch_size = batch_size
+        self.sequence_provider = sequence_provider
 
-        self.shortctx_dropout_mask = torch.full(
-            (model_config.out_ctx_len,),
-            train_config.short_ctx_dropout_p,
-            dtype=torch.float32,
-            device=self.device,
-        )
-
+        # TODO: pre-create uncommitted mask
         # ensure state exists
         self.init_state()
 
-    def next_sequence(self) -> bytes:
-        return self.sequence_provider.next_sequence()
+    def next_sequence(self) -> list[int]:
+        text = self.sequence_provider.next_sequence()
+        text_bytes = text.encode('utf-8')
+        short_ctx_len = self.model_config.short_ctx_len
+        out_ctx_len = self.model_config.out_ctx_len
+        start_pad = [ControlTokens.PAD] * (short_ctx_len - 1) + [ControlTokens.START_OF_TEXT]
+        end_pad = [ControlTokens.END_OF_TEXT] + [ControlTokens.EMPTY] * (out_ctx_len - 1)
+        return start_pad + list(text_bytes) + end_pad
 
     def init_state(self):
         "initialize internal state for new batch"
         # initialize shift to the full output length so all are marked as new
-        self.prev_shift = torch.full(
+        self.prev_shifts = torch.full(
             (self.batch_size,),
             self.model_config.out_ctx_len,
             dtype=torch.int64,
             device=self.device,
         )
-        self.prev_output_tokens = torch.zeros(
+        self.prev_output_embeddings = torch.zeros(
             (self.batch_size, self.model_config.out_ctx_len, self.model_config.d_embed),
             dtype=self.dtype,
+            device=self.device,
+        )
+        self.prev_output_tokens = torch.full(
+            (self.batch_size, self.model_config.out_ctx_len),
+            ControlTokens.EMPTY,
+            dtype=torch.int64,
             device=self.device,
         )
         self.recurrent = self.model.recurrent_init.unsqueeze(0).repeat_interleave(self.batch_size, 0)
@@ -151,20 +168,6 @@ class TrainBatch:
                     short_ctx_l[-1] = info.backspace_placeholder
                     next_token_val = self.tokenizer['<del>']
 
-            # calculate new_mask and update prev_offset
-            if info.prev_offset is None:
-                # no previous iteration
-                new_mask_l = [True] * short_ctx_len
-            else:
-                new_mask_l = [False] * short_ctx_len
-                if info.offset > info.prev_offset:
-                    delta = info.offset - info.prev_offset
-                    new_mask_l[-delta:] = [True] * delta
-                elif info.offset < info.prev_offset:
-                    delta = info.prev_offset - info.offset
-                    new_mask_l[:delta] = [True] * delta
-            info.prev_offset = info.offset
-
             short_ctx = torch.tensor(short_ctx_l, dtype=torch.int64, device='cpu', pin_memory=True)
             new_mask = torch.tensor(new_mask_l, dtype=torch.bool, device='cpu', pin_memory=True)
             next_token = torch.tensor(next_token_val, dtype=torch.int64, device='cpu', pin_memory=True)
@@ -193,18 +196,12 @@ class TrainBatch:
         self,
         recurrent: torch.Tensor,
         short_ctx: torch.Tensor,
-        new_mask: torch.Tensor,
         expected_output: torch.Tensor,
-        min_p_halt: torch.Tensor,
-        p_not_halt: torch.Tensor,
-        prev_loss_mean: torch.Tensor,
-        prev_loss_std: torch.Tensor,
     ):
-        # replace some tokens in short ctx with <pad>, but never "new" tokens
+        # replace some tokens in short ctx with <pad>, except for control tokens
         short_ctx = torch.where(
-            (self.shortctx_dropout_mask.bernoulli() > 0)
-                .unsqueeze(0)
-                .logical_and(new_mask.logical_not()),
+            (torch.full(short_ctx.shape, self.train_config.short_ctx_dropout_p).bernoulli() > 0)
+                .logical_and(short_ctx < 256),
             ControlTokens.PAD,
             short_ctx,
         )
@@ -214,58 +211,27 @@ class TrainBatch:
 
         # calculate losses
         cross_entropy = F.cross_entropy(token_out, expected_output, reduction='none')
-        confidence_losses = self.train_config.confidence_scale * \
-            confidence_loss(cross_entropy, confidence_out, prev_loss_mean, prev_loss_std)
-        # p_halt_out does not need grad
-        p_halt_out = F.sigmoid(confidence_out.detach() + self.model_config.ponder_adjust)
-        # enforce min_p_halt when determining halt only
-        did_halt = torch.maximum(p_halt_out, min_p_halt).bernoulli() > 0
 
         step_weight = p_halt_out ** 2.5
         # if halted, override to 1
         step_weight = torch.where(did_halt, 1., step_weight)
-        weighted_losses = p_not_halt * step_weight * cross_entropy + confidence_losses
+        weighted_losses = p_not_halt * step_weight * cross_entropy
 
-        # prepare next p_not_halt
-        # reset p_not_halt if halted, otherwise add current
-        p_not_halt_next = torch.where(did_halt, 1., p_not_halt * (1 - step_weight))
-
-        return next_recurrent, token_out, confidence_out, p_halt_out, \
-            did_halt, cross_entropy, confidence_losses, weighted_losses, p_not_halt_next
+        return next_recurrent, token_out, cross_entropy, weighted_losses
 
     def forward_step(self, force_halt=False):
         short_ctx_len = self.model_config.short_ctx_len
+        out_ctx_len = self.model_config.out_ctx_len
         input_short_ctx, input_new_mask, expected_output = self.prepare_batch()
 
-        next_recurrent, _token_out, _confidence_out, _p_halt_out, did_halt, \
-            cross_entropy, confidence_losses, weighted_losses, p_not_halt_next = \
+        next_recurrent, token_out, cross_entropy, weighted_losses = \
             self.forward_batch(
                 self.recurrent,
                 input_short_ctx,
-                input_new_mask,
                 expected_output,
-                # prevent torch.compile from recompiling on change
-                min_p_halt=torch.tensor(
-                    self.train_config.min_p_halt if not force_halt else 1.,
-                    device=self.device,
-                    dtype=self.dtype
-                ),
-                p_not_halt=self.p_not_halt,
-                prev_loss_mean=torch.tensor(
-                    self.train_config.prev_loss_mean,
-                    device=self.device,
-                    dtype=self.dtype,
-                ),
-                prev_loss_std=torch.tensor(
-                    self.train_config.prev_loss_std,
-                    device=self.device,
-                    dtype=self.dtype,
-                ),
             )
 
         cross_entropy_cpu = cross_entropy.detach().to('cpu', non_blocking=True)
-        confidence_losses_cpu = confidence_losses.detach().to('cpu', non_blocking=True)
-        did_halt_cpu = did_halt.to('cpu', non_blocking=True)
 
         #print('forward_step(): p_halt', p_halt_out)
         #print('forward_step(): confidence', _confidence_out)
@@ -274,8 +240,6 @@ class TrainBatch:
             next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad))
 
         self.recurrent = next_recurrent
-        self.p_not_halt = p_not_halt_next
-        self.halted_sequences.clear()
         ended_count = 0
 
         for i, info in enumerate(self.sequences):
@@ -285,31 +249,20 @@ class TrainBatch:
                 continue
 
             info.losses.append(weighted_losses[i])
-            info.confidence_losses.append(confidence_losses_cpu[i])
 
             info.prev_halted = did_halt_cpu[i]
             if info.prev_halted:
-                self.halted_sequences.append(i)
                 # record unweighted loss as well
                 info.halted_losses.append(cross_entropy_cpu[i])
 
-                if info.backspace_placeholder is not None:
-                    # shift window back by one token
-                    info.offset -= 1
-                    info.backspace_placeholder = None
+                # check if sequence ended
+                # we end when the model advances past the end padding
+                if offset >= len(info.sequence) - (short_ctx_len + out_ctx_len):
+                    info.ended = True
+                    ended_count += 1
                 else:
-                    # check if sequence ended
-                    # we end one token before the last otherwise there is no "next" token to train on
-                    if info.offset + short_ctx_len >= len(info.sequence) - 1:
-                        info.ended = True
-                        ended_count += 1
-                    else:
-                        # slide shortctx to include next token
-                        info.offset += 1
-
-                    # tick down backspace_gap
-                    if info.backspace_gap > 0:
-                        info.backspace_gap -= 1
+                    # slide shortctx to include next token
+                    info.offset += 1
 
         return ended_count
 
@@ -331,20 +284,6 @@ class TrainBatch:
             seq_mean = torch.stack(info.halted_losses).sum() / len(info.halted_losses)
             yield seq_mean
 
-    def iter_confidence_losses(self) -> torch.Tensor:
-        # TODO: this function ought to just return a histogram or something
-        sequence_losses = []
-        for info in self.sequences:
-            if len(info.confidence_losses) == 0:
-                continue
-
-            sequence_losses.append(
-                torch.stack(info.confidence_losses).sum() / len(info.confidence_losses)
-            )
-
-        return torch.stack(sequence_losses).sum() / len(sequence_losses) \
-            / self.train_config.confidence_scale
-
 class TrainHelper:
     aim_run: aim.Run | None = None
     "Aim run instance for run tracking"
@@ -355,7 +294,7 @@ class TrainHelper:
     train_config: TrainConfig
     device: torch.device
     dtype: torch.dtype
-    sequence_provider: SequenceProvider
+    sequence_provider: SequenceProvider | None
 
     train_loss: float = 0.0
     "Train loss for current step"
@@ -387,6 +326,7 @@ class TrainHelper:
             self.train_config.accumulate_gradients * 16
 
     def prepare(self):
+        assert self.sequence_provider is not None
         for _ in range(self.batch_count):
             batch = TrainBatch(
                 model=self.model,
@@ -500,6 +440,7 @@ def main():
         checkpoint_path = sys.argv[2]
         data_path = sys.argv[3]
 
+        print('reading checkpoint')
         loaded = torch.load(checkpoint_path, map_location='cpu')
         model_config = ModelConfig.from_dict(loaded['model_config'])
         train_config = TrainConfig.from_dict(loaded['train_config'])
@@ -531,22 +472,7 @@ def main():
 
     # TODO: temp hack
     data_iter = filter_text(load_dataset(open(data_path, 'rb')))
-
-    class TempSeqProvider:
-        def __init__(self):
-            self.pad_token = tokenizer['<pad>']
-            self.text_start_token = tokenizer['<s>']
-
-        def wrap_sequence(self, tokens: list[int]):
-            pad_start = [self.pad_token] * (model_config.short_ctx_len - 1) + [self.text_start_token]
-            return pad_start + tokens
-
-        def next_sequence(self):
-            document = next(data_iter)
-            encoded = self.wrap_sequence(tokenizer.Encode(document))[:train_config.max_seq_len]
-            return encoded
-
-    trainer.sequence_provider = TempSeqProvider()
+    trainer.sequence_provider = SequenceProvider(data_iter)
 
     model = trainer.model
     optimizer = train_config.make_optimizer(
@@ -605,8 +531,6 @@ def main():
         print('unweighted loss:', unweighted_loss_f)
         trainer.track(train_loss_f, name='train_loss', step=step)
         trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
-        # confidence_loss_f = trainer.sum_confidence_losses().item()
-        # trainer.track(confidence_loss_f, name='confidence_loss', step=step)
 
         grad_norm_f = nn.utils.clip_grad_norm_(
             model.parameters(),
