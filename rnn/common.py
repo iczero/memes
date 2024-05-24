@@ -184,3 +184,16 @@ def safetensors_load_metadata(filename):
         meta_len, = struct.unpack('<Q', meta_len_b)
         meta_dict = json.loads(f.read(meta_len))
         return meta_dict['__metadata__']
+
+def dump_sequence(tokens: list[int] | torch.Tensor) -> str:
+    out = bytearray()
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()
+
+    for token in tokens:
+        if token < 256:
+            out += token.to_bytes(1)
+        else:
+            out += f'[{ControlTokens(token).name}]'.encode()
+
+    return repr(out.decode('utf-8', errors='replace'))

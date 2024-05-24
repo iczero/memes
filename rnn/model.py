@@ -101,11 +101,11 @@ class CrossAttentionInput(nn.Module):
             activation=config.get_activation(),
         )
 
-    def forward(self, current: torch.Tensor, inputs: torch.Tensor, uncommitted: torch.Tensor):
+    def forward(self, current: torch.Tensor, inputs: torch.Tensor, committed: torch.Tensor):
         # (batch, stream) -> (batch, stream, d_embed)
         inputs = self.input_embedding(inputs)
         # mark uncommitted positions
-        inputs = inputs + torch.where(uncommitted.unsqueeze(-1), self.uncommited_marker, 0)
+        inputs = inputs + torch.where(committed.unsqueeze(-1), 0, self.uncommited_marker)
         # apply rotary embedding to byte embeddings directly
         inputs = self.rope(inputs)
 
@@ -277,10 +277,10 @@ class RNN(nn.Module):
         self,
         recurrent: torch.Tensor,
         inputs: torch.Tensor,
-        inputs_uncommitted: torch.Tensor,
+        inputs_committed: torch.Tensor,
         output_count: int,
     ):
-        recurrent = recurrent + self.input(recurrent, inputs, inputs_uncommitted)
+        recurrent = recurrent + self.input(recurrent, inputs, inputs_committed)
         for layer in self.intermediate:
             recurrent = recurrent + layer(recurrent)
 
