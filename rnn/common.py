@@ -116,6 +116,10 @@ class TrainConfig:
     "Optimizer to use"
     short_ctx_dropout_p: float
     "Probability to drop an input token from the short context"
+    drift_commit_p_scale: float
+    "Some value that goes into calculation of probability of commit"
+    drift_commit_p_min: float
+    "Minimum commit probability"
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
@@ -129,6 +133,8 @@ class TrainConfig:
             optimizer=str(obj['optimizer']),
             accumulate_gradients=int(obj['accumulate_gradients']),
             short_ctx_dropout_p=float(obj['short_ctx_dropout_p']),
+            drift_commit_p_scale=float(obj['drift_commit_p_scale']),
+            drift_commit_p_min=float(obj['drift_commit_p_min']),
         )
 
     def to_dict(self):

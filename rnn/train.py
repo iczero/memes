@@ -1,8 +1,10 @@
 import dataclasses
 import datetime
 import json
+import math
 import signal
 import sys
+import typing
 
 import aim
 import torch
@@ -49,8 +51,6 @@ class TrainSequence:
     "Byte sequence"
     offset: int = 0
     "Current offset into the sequence"
-    last_shift: int = 0
-    "Length of previous sequence shift"
     ended: bool = False
     "If the sequence has reached the end"
     losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
@@ -79,6 +79,7 @@ class TrainBatch:
     sequence_provider: SequenceProvider
     advance_rate: list[float]
     "Averages of advance rate in characters per step"
+    active_batches: torch.Tensor
 
     def __init__(
         self,
@@ -102,6 +103,12 @@ class TrainBatch:
             torch.full((self.model_config.short_ctx_len,), True),
             torch.full((self.model_config.out_ctx_len,), False),
         ), dim=-1).expand((self.batch_size, -1)).to(self.device)
+        # output position weighting
+        out_ctx_len = self.model_config.out_ctx_len
+        # TODO: maybe make this a hyperparameter
+        self.out_pos_weight = (torch.arange(out_ctx_len) * (-1 / out_ctx_len) * 0.5 + 1) \
+            .to(device=self.device, dtype=self.dtype)
+
         # ensure state exists
         self.init_state()
 
@@ -132,7 +139,7 @@ class TrainBatch:
             (self.batch_size, self.model_config.out_ctx_len),
             ControlTokens.EMPTY,
             dtype=torch.int64,
-            device=self.device,
+            device='cpu',
         )
         self.recurrent = self.model.recurrent_init.unsqueeze(0).repeat_interleave(self.batch_size, 0)
 
@@ -160,12 +167,13 @@ class TrainBatch:
             (self.batch_size, out_ctx_len),
             device='cpu', dtype=torch.int64, pin_memory=True,
         )
+        prev_shifts = self.prev_shifts.to('cpu')
         for i, info in enumerate(self.sequences):
             # write short ctx
-            short_ctx = torch.tensor(info.sequence[info.offset : info.offset + short_ctx_len])
+            short_ctx = torch.tensor(info.sequence[info.offset : info.offset + short_ctx_len], device='cpu')
             # apply short ctx dropout, skip control tokens
             short_ctx = torch.where(
-                (torch.full((short_ctx_len,), self.train_config.short_ctx_dropout_p).bernoulli() > 0)
+                (torch.full((short_ctx_len,), self.train_config.short_ctx_dropout_p, device='cpu').bernoulli() > 0)
                     .logical_and(short_ctx < 256),
                 ControlTokens.PAD,
                 short_ctx,
@@ -174,10 +182,11 @@ class TrainBatch:
 
             # write previous output
             prev_out = self.prev_output_tokens[i]
-            if info.last_shift > 0:
-                prev_out = torch.roll(prev_out, -info.last_shift)
+            prev_shift = typing.cast(int, prev_shifts[i].item())
+            if prev_shift > 0:
+                prev_out = torch.roll(prev_out, -prev_shift)
                 # add empty tokens to end
-                prev_out[-info.last_shift:] = ControlTokens.EMPTY
+                prev_out[-prev_shift:] = ControlTokens.EMPTY
 
             # write expected output
             input_sequences[i][short_ctx_len:] = prev_out
@@ -204,6 +213,9 @@ class TrainBatch:
         input_sequence: torch.Tensor,
         committed_mask: torch.Tensor,
         expected_output: torch.Tensor,
+        prev_shifts: torch.Tensor,
+        prev_output_embeddings: torch.Tensor,
+        active_batches: torch.Tensor,
     ):
         # forward model
         next_recurrent, embeddings_out, tokens_out = \
@@ -211,35 +223,71 @@ class TrainBatch:
 
         # calculate losses
         cross_entropy = F.cross_entropy(tokens_out, expected_output, reduction='none')
+        # cross entropy loss by position weighting but not drift weighting
+        # detached since this is not used to calculate loss
+        pos_weighted_losses = (cross_entropy.detach() * self.out_pos_weight) \
+            .sum(dim=-1) / self.out_pos_weight.sum(dim=-1)
 
-        step_weight = p_halt_out ** 2.5
-        # if halted, override to 1
-        step_weight = torch.where(did_halt, 1., step_weight)
-        weighted_losses = p_not_halt * step_weight * cross_entropy
+        # euclidean distance between current and previous output embeddings
+        prev_shifted = batch_roll(prev_output_embeddings, prev_shifts)
+        out_drift: torch.Tensor = ((embeddings_out.detach() - prev_shifted) ** 2).sum(dim=-1).sqrt()
+        # calculate probability of commit
+        commit_p_coeff = self.train_config.drift_commit_p_scale * math.sqrt(self.model_config.d_embed)
+        drift_commit_p = torch.pow(2., -out_drift / commit_p_coeff)
+        # mask "new" outputs to zero
+        drift_commit_p = torch.where(
+            (torch.arange(-self.model_config.out_ctx_len, 0) >= -prev_shifts.unsqueeze(-1)).unsqueeze(-1),
+            0.,
+            drift_commit_p
+        )
+        # apply minimum probability for commit
+        drift_commit_p = drift_commit_p.maximum(torch.tensor(self.train_config.drift_commit_p_min))
 
-        return next_recurrent, token_out, cross_entropy, weighted_losses
+        drift_committed = drift_commit_p.bernoulli()
+        # find first uncommitted index, or out_ctx_len if all are committed somehow
+        next_shifts = torch.where(
+            (drift_committed - 1).sum(dim=-1) == 0.,
+            torch.argmax(drift_committed * -1, dim=-1),
+            self.model_config.out_ctx_len,
+        )
 
-    def forward_step(self, force_halt=False):
+        # weight both
+        full_weights = drift_commit_p * self.out_pos_weight
+        full_weighted_losses = (cross_entropy * full_weights).sum(dim=-1) / full_weights.sum(dim=-1)
+
+        # mask out inactive (ended) batches
+        batch_mask = torch.where(active_batches, 1., 0.)
+        batch_mask_sum = batch_mask.sum(dim=-1)
+        pos_weighted_losses_mean = (pos_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
+        full_weighted_losses_mean = (full_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
+
+        return next_recurrent, tokens_out, embeddings_out, full_weighted_losses_mean, \
+            pos_weighted_losses_mean, next_shifts, out_drift
+
+    def forward_step(self):
         short_ctx_len = self.model_config.short_ctx_len
         out_ctx_len = self.model_config.out_ctx_len
-        input_short_ctx, input_new_mask, expected_output = self.prepare_batch()
+        input_short_ctx, committed_mask, expected_output = self.prepare_batch()
 
-        next_recurrent, token_out, cross_entropy, weighted_losses = \
+        next_recurrent, tokens_out, embeddings_out, full_weighted_lossses, \
+            pos_weighted_losses, next_shifts, out_drift = \
             self.forward_batch(
                 self.recurrent,
                 input_short_ctx,
+                committed_mask,
                 expected_output,
+                self.prev_shifts,
+                self.prev_output_embeddings,
+                active_batches,
             )
 
-        cross_entropy_cpu = cross_entropy.detach().to('cpu', non_blocking=True)
-
-        #print('forward_step(): p_halt', p_halt_out)
-        #print('forward_step(): confidence', _confidence_out)
-
         if isinstance(DEBUG_RECURRENT_GRAD, list):
-            next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad))
+            next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad)) # type: ignore
 
         self.recurrent = next_recurrent
+        self.prev_output_embeddings = embeddings_out
+        self.prev_output_tokens = tokens_out.to('cpu', non_blocking=True)
+        self.prev_shifts = next_shifts
         ended_count = 0
 
         for i, info in enumerate(self.sequences):
@@ -265,24 +313,6 @@ class TrainBatch:
                     info.offset += 1
 
         return ended_count
-
-    def iter_train_losses(self):
-        for info in self.sequences:
-            if len(info.losses) == 0:
-                assert info.ended
-                continue
-
-            # losses for each individual ponder step should be summed
-            halt_steps = max(len(info.halted_losses), 1)
-            yield torch.stack(info.losses).sum() / halt_steps
-
-    def iter_unweighted_losses(self):
-        for info in self.sequences:
-            if len(info.halted_losses) == 0:
-                continue
-
-            seq_mean = torch.stack(info.halted_losses).sum() / len(info.halted_losses)
-            yield seq_mean
 
 class TrainHelper:
     aim_run: aim.Run | None = None

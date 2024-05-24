@@ -1,0 +1,29 @@
+{
+  "model_config": {
+    "d_embed": 128,
+    "n_attention_heads": 6,
+    "n_streams": 16,
+    "ff_dropout_p": 0.0,
+    "attn_dropout_p": 0.0,
+    "n_intermediate": 4,
+    "resid_gate_multiplier": 2.0,
+    "d_ff_inner": 512,
+    "activation": "gelu",
+    "dtype": "float32",
+    "qkv_bias": true,
+    "short_ctx_len": 64,
+    "out_ctx_len": 32
+  },
+  "train_config": {
+    "lr": 1e-4,
+    "weight_decay": 0.05,
+    "batch_size": 21,
+    "truncate_steps": 110,
+    "accumulate_gradients": 3,
+    "clip_grad_norm": 3.0,
+    "optimizer": "AdamW",
+    "short_ctx_dropout_p": 0.05,
+    "drift_commit_p_scale": 50.0,
+    "drift_commit_p_min": 0.1
+  }
+}
