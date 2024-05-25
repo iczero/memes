@@ -16,7 +16,7 @@ from .common import ControlTokens, ModelConfig, TrainConfig, dump_sequence
 from .data import SequenceProvider, filter_text, load_dataset
 from .model import RNN
 
-DISABLE_TORCH_COMPILE = False
+DISABLE_TORCH_COMPILE = True
 "If torch.compile should be disabled"
 HAS_PIN_MEMORY = True
 "Whether pin_memory may be used"
@@ -39,7 +39,7 @@ def batch_roll(data: torch.Tensor, shift_by: torch.Tensor) -> torch.Tensor:
 
     roll_size = data.shape[-2]
     # generate indices
-    index_range = torch.arange(roll_size)
+    index_range = torch.arange(roll_size, device=data.device)
     # shift indices by shift_by, wrap around
     shift_mask = (index_range.unsqueeze(0) + shift_by.unsqueeze(-1)) % roll_size
     # broadcast shift_mask to fit data
@@ -208,12 +208,12 @@ class TrainBatch:
                 info.sequence[info.offset + short_ctx_len : info.offset + short_ctx_len + out_ctx_len]
             )
 
-            print(
-                'batch element:', i,
-                dump_sequence(input_sequences[i]),
-                '->',
-                dump_sequence(output_sequences[i]),
-            )
+            # print(
+            #     'batch element:', i,
+            #     dump_sequence(input_sequences[i]),
+            #     '->',
+            #     dump_sequence(output_sequences[i]),
+            # )
 
         input_sequences = input_sequences.to(self.device, non_blocking=True)
         output_sequences = output_sequences.to(self.device, non_blocking=True)
@@ -231,12 +231,14 @@ class TrainBatch:
         prev_output_embeddings: torch.Tensor,
         active_batches: torch.Tensor,
     ):
+        out_ctx_len = self.model_config.out_ctx_len
         # forward model
-        next_recurrent, embeddings_out, tokens_out = \
+        next_recurrent, embeddings_out, token_logits_out = \
             self.model(recurrent, input_sequence, committed_mask, self.model_config.out_ctx_len)
 
         # calculate losses
-        cross_entropy = F.cross_entropy(tokens_out, expected_output, reduction='none')
+        # needs transpose due to cross_entropy shape expectations
+        cross_entropy = F.cross_entropy(token_logits_out.transpose(-2, -1), expected_output, reduction='none')
         # cross entropy loss by position weighting but not drift weighting
         # detached since this is not used to calculate loss
         pos_weighted_losses = (cross_entropy.detach() * self.out_pos_weight) \
@@ -250,7 +252,7 @@ class TrainBatch:
         drift_commit_p = torch.pow(2., -out_drift / commit_p_coeff)
         # mask "new" outputs to zero
         drift_commit_p = torch.where(
-            (torch.arange(-self.model_config.out_ctx_len, 0) >= -prev_shifts.unsqueeze(-1)).unsqueeze(-1),
+            (torch.arange(-out_ctx_len, 0, device=prev_shifts.device) >= -prev_shifts.unsqueeze(-1)),
             0.,
             drift_commit_p
         )
@@ -262,7 +264,7 @@ class TrainBatch:
         next_shifts = torch.where(
             (drift_committed - 1).sum(dim=-1) == 0.,
             torch.argmax(drift_committed * -1, dim=-1),
-            self.model_config.out_ctx_len,
+            out_ctx_len,
         )
 
         # weight both
@@ -276,10 +278,15 @@ class TrainBatch:
         full_weighted_losses_mean = (full_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
 
         # sample token for tokens_out
-        tokens_out_sampled = (tokens_out / self.train_config.drift_sample_temperature) \
-            .softmax(dim=-1) \
-            .multinomial(1) \
-            .squeeze(-1)
+        # TODO: multinomial doesn't work with batches, use argmax for now
+        # tokens_out_sampled = (tokens_out / self.train_config.drift_sample_temperature) \
+        #     .softmax(dim=-1) \
+        #     .multinomial(1) \
+        #     .squeeze(-1)
+        tokens_out_sampled = token_logits_out.argmax(dim=-1)
+
+        # no grads needed
+        embeddings_out = embeddings_out.detach()
 
         return next_recurrent, tokens_out_sampled, embeddings_out, full_weighted_losses_mean, \
             pos_weighted_losses_mean, next_shifts, out_drift
@@ -619,4 +626,5 @@ def main():
 if __name__ == '__main__':
     #import cProfile
     #cProfile.run('main()', sort='tottime')
+    torch.autograd.set_detect_anomaly(True)
     main()

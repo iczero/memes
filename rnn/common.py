@@ -49,7 +49,7 @@ class ModelConfig:
     out_ctx_len: int
     "Length of output buffer"
     vocab_size: int = 256 + len(ControlTokens)
-    "Vocabulary size"
+    "Vocabulary size, not read from config"
 
     def __post_init__(self):
         assert self.d_embed > 0
@@ -63,7 +63,6 @@ class ModelConfig:
         return cls(
             d_embed=int(obj['d_embed']),
             n_attention_heads=int(obj['n_attention_heads']),
-            vocab_size=int(obj['vocab_size']),
             n_streams=int(obj['n_streams']),
             ff_dropout_p=float(obj['ff_dropout_p']),
             attn_dropout_p=float(obj['attn_dropout_p']),

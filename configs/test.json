@@ -17,9 +17,9 @@
   "train_config": {
     "lr": 1e-4,
     "weight_decay": 0.05,
-    "batch_size": 21,
-    "truncate_steps": 110,
-    "accumulate_gradients": 3,
+    "batch_size": 16,
+    "truncate_steps": 64,
+    "accumulate_gradients": 1,
     "clip_grad_norm": 3.0,
     "optimizer": "AdamW",
     "short_ctx_dropout_p": 0.05,
