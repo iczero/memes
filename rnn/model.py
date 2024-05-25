@@ -7,11 +7,12 @@ from torch.nn import functional as F
 from .common import ModelConfig
 from .rotary_encoding import RotaryEncoding
 
-torch.set_printoptions(profile='full')
+#torch.set_printoptions(profile='full')
 def oh_no(x: torch.Tensor):
-    if torch.any(x.abs() > 1e12).item():
+    if x.abs().max() > 1e12:
         print(x)
-        raise RuntimeError('detected very large values')
+        print('offending value:', x.abs().max())
+        raise RuntimeError('detected very large value(s)')
     if not torch.all(torch.isfinite(x)).item():
         if torch.any(torch.isnan(x)).item():
             print('detected nan values')
@@ -79,6 +80,8 @@ class BatchGLU(nn.Module):
         mid_1, mid_2 = self.w_in(x).split(self.d_mid, dim=-1)
         oh_no(mid_1)
         oh_no(mid_2)
+        print('mid_1 max:', mid_1.abs().max())
+        print('mid_2 max:', mid_2.abs().max())
         mid = self.activation(mid_1) * mid_2
         oh_no(mid)
         #return self.w_out(mid)

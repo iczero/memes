@@ -430,6 +430,7 @@ class TrainHelper:
         # forward step TODO:
         should_new_seq = True
         for i in range(self.train_config.truncate_steps):
+            print('step:', i)
             done_count = batch.forward_step()
             if done_count >= batch.batch_size / 2:
                 should_new_seq = True
