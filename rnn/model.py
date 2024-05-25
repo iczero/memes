@@ -7,21 +7,6 @@ from torch.nn import functional as F
 from .common import ModelConfig
 from .rotary_encoding import RotaryEncoding
 
-#torch.set_printoptions(profile='full')
-def oh_no(x: torch.Tensor):
-    if x.abs().max() > 1e12:
-        print(x)
-        print('offending value:', x.abs().max())
-        raise RuntimeError('detected very large value(s)')
-    if not torch.all(torch.isfinite(x)).item():
-        if torch.any(torch.isnan(x)).item():
-            print('detected nan values')
-        if torch.any(torch.isinf(x)).item():
-            print('detected +/-inf values')
-
-        print(x)
-        raise RuntimeError('non-finite values detected')
-
 class GLU(nn.Module):
     def __init__(self, in_dim, out_dim, activation, bias=True):
         super().__init__()
@@ -57,13 +42,10 @@ class BatchLinear(nn.Module):
         # in: (batch, stream, d_embed)
         # x @ W^T + b
         # transpose to (stream, batch, d_embed) then batch matmul and transpose back
-        oh_no(x)
         x = torch.bmm(x.transpose(-2, -3), self.weight.mT).transpose(-2, -3)
-        oh_no(x)
         if self.has_bias:
             # add bias (broadcasted): (batch, stream, d_embed) + (1, stream, d_embed)
             x = x + self.bias
-            oh_no(x)
 
         return x
 
@@ -76,18 +58,9 @@ class BatchGLU(nn.Module):
         self.w_out = BatchLinear(n_streams, d_mid, d_out, has_bias=has_bias)
 
     def forward(self, x: torch.Tensor):
-        oh_no(x)
         mid_1, mid_2 = self.w_in(x).split(self.d_mid, dim=-1)
-        oh_no(mid_1)
-        oh_no(mid_2)
-        print('mid_1 max:', mid_1.abs().max())
-        print('mid_2 max:', mid_2.abs().max())
         mid = self.activation(mid_1) * mid_2
-        oh_no(mid)
-        #return self.w_out(mid)
-        out = self.w_out(mid)
-        oh_no(out)
-        return out
+        return self.w_out(mid)
 
 def apply_inline_gate(x: torch.Tensor, gate_multiplier: float):
     # (..., d_embed + 1) -> (..., d_embed)
@@ -129,45 +102,35 @@ class CrossAttentionInput(nn.Module):
         )
 
     def forward(self, current: torch.Tensor, inputs: torch.Tensor, committed: torch.Tensor):
-        oh_no(current)
         # (batch, stream) -> (batch, stream, d_embed)
         inputs_embed = self.input_embedding(inputs)
-        oh_no(inputs_embed)
         # mark uncommitted positions
         inputs_embed = inputs_embed + torch.where(committed.unsqueeze(-1), 0, self.uncommitted_marker)
-        oh_no(inputs_embed)
         # apply rotary embedding to byte embeddings directly
         inputs_embed = self.rope(inputs_embed)
-        oh_no(inputs_embed)
 
         q = self.q_linear(self.norm(current)) \
             .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
             .transpose(-2, -3)
-        oh_no(q)
         # kv_merged: (batch, stream, 2 (k/v), n_heads, d_embed)
         kv_merged = self.kv_linear(inputs_embed) \
             .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
-        oh_no(kv_merged)
         k = kv_merged[..., 0, :, :].transpose(-2, -3)
         v = kv_merged[..., 1, :, :].transpose(-2, -3)
 
         # -> (batch, stream, n_heads, d_embed)
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
-        oh_no(attn_out)
         # add skip
         attn_out = torch.cat((attn_out, current.unsqueeze(-2)), dim=-2)
         # scale heads
         attn_out = self.head_scales.unsqueeze(-1) * attn_out
-        oh_no(attn_out)
 
         attn_concat = attn_out.flatten(-2, -1)
         # attn_concat: (batch, stream, n_heads * d_embed + 1)
         ff_out = self.feedforward(attn_concat)
-        oh_no(ff_out)
 
         resid = apply_inline_gate(ff_out, self.resid_gate_multiplier)
-        oh_no(resid)
         return resid
 
 class Intermediate(nn.Module):
@@ -201,36 +164,28 @@ class Intermediate(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        oh_no(x)
         x_norm = self.norm(x)
-        oh_no(x_norm)
         q = self.q_linear(x_norm) \
             .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
             .transpose(-2, -3)
-        oh_no(q)
         kv_merged = self.kv_linear(x_norm) \
             .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
-        oh_no(kv_merged)
         k = kv_merged[..., 0, :, :].transpose(-2, -3)
         v = kv_merged[..., 1, :, :].transpose(-2, -3)
 
         # -> (batch, stream, n_heads, d_embed)
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
-        oh_no(attn_out)
         # add skip
         attn_out = torch.cat((attn_out, x_norm.unsqueeze(-2)), dim=-2)
         # scale heads
         attn_out = self.head_scales.unsqueeze(-1) * attn_out
-        oh_no(attn_out)
 
         attn_concat = attn_out.flatten(-2, -1)
         # attn_concat: (batch, stream, n_heads * d_embed + 1)
         ff_out = self.feedforward(attn_concat)
-        oh_no(ff_out)
 
         resid = apply_inline_gate(ff_out, self.resid_gate_multiplier)
-        oh_no(resid)
         return resid
 
 class PreOutput(nn.Module):
@@ -325,17 +280,11 @@ class RNN(nn.Module):
         inputs_committed: torch.Tensor,
         output_count: int,
     ):
-        oh_no(recurrent)
         recurrent = recurrent + self.input(recurrent, inputs, inputs_committed)
-        oh_no(recurrent)
         for layer in self.intermediate:
             recurrent = recurrent + layer(recurrent)
-            oh_no(recurrent)
 
         output = self.pre_output(recurrent)
-        oh_no(output)
         embeddings_out, logits_out = self.char_decode(output, output_count)
-        oh_no(embeddings_out)
-        oh_no(logits_out)
 
         return recurrent, embeddings_out, logits_out

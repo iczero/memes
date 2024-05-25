@@ -430,7 +430,6 @@ class TrainHelper:
         # forward step TODO:
         should_new_seq = True
         for i in range(self.train_config.truncate_steps):
-            print('step:', i)
             done_count = batch.forward_step()
             if done_count >= batch.batch_size / 2:
                 should_new_seq = True
@@ -627,5 +626,5 @@ def main():
 if __name__ == '__main__':
     #import cProfile
     #cProfile.run('main()', sort='tottime')
-    torch.autograd.set_detect_anomaly(True)
+    #torch.autograd.set_detect_anomaly(True)
     main()
