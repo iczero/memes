@@ -120,6 +120,8 @@ class TrainConfig:
     "Some value that goes into calculation of probability of commit"
     drift_commit_p_min: float
     "Minimum commit probability"
+    drift_sample_temperature: float
+    "Sampling temperature for token selection during training"
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
@@ -135,6 +137,7 @@ class TrainConfig:
             short_ctx_dropout_p=float(obj['short_ctx_dropout_p']),
             drift_commit_p_scale=float(obj['drift_commit_p_scale']),
             drift_commit_p_min=float(obj['drift_commit_p_min']),
+            drift_sample_temperature=float(obj['drift_sample_temperature']),
         )
 
     def to_dict(self):

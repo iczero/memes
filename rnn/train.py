@@ -18,6 +18,8 @@ from .model import RNN
 
 DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
+HAS_PIN_MEMORY = True
+"Whether pin_memory may be used"
 
 # extreme hack (temporarily permanent)
 DEBUG_RECURRENT_GRAD: list[torch.Tensor] | bool | None = None
@@ -53,10 +55,6 @@ class TrainSequence:
     "Current offset into the sequence"
     ended: bool = False
     "If the sequence has reached the end"
-    losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
-    "List of losses for all steps"
-    unweighted_losses: list[torch.Tensor] = dataclasses.field(default_factory=list)
-    "List of losses for all steps before distance weighting, but after temporal weighting"
 
 class TrainBatch:
     model_config: ModelConfig
@@ -80,6 +78,11 @@ class TrainBatch:
     advance_rate: list[float]
     "Averages of advance rate in characters per step"
     active_batches: torch.Tensor
+    "Which batches are currently active (not ended, etc)"
+    losses: list[torch.Tensor]
+    "List of losses for all steps"
+    pos_weighted_losses: list[torch.Tensor]
+    "List of losses for all steps before drift weighting, but after temporal weighting"
 
     def __init__(
         self,
@@ -141,7 +144,14 @@ class TrainBatch:
             dtype=torch.int64,
             device='cpu',
         )
+        self.active_batches = torch.full(
+            (self.batch_size,),
+            True,
+            device=self.device,
+        )
         self.recurrent = self.model.recurrent_init.unsqueeze(0).repeat_interleave(self.batch_size, 0)
+        self.losses = []
+        self.pos_weighted_losses = []
 
     def initialize_sequences(self):
         self.init_state()
@@ -152,8 +162,8 @@ class TrainBatch:
     def detach_all(self):
         "Prepare for next batch"
         self.recurrent = self.recurrent.detach()
-        for info in self.sequences:
-            info.losses.clear()
+        self.losses.clear()
+        self.pos_weighted_losses.clear()
 
     def prepare_batch(self):
         # prepare inputs and expected output
@@ -161,14 +171,18 @@ class TrainBatch:
         out_ctx_len = self.model_config.out_ctx_len
         input_sequences = torch.zeros(
             (self.batch_size, short_ctx_len + out_ctx_len),
-            device='cpu', dtype=torch.int64, pin_memory=True,
+            device='cpu', dtype=torch.int64, pin_memory=HAS_PIN_MEMORY,
         )
         output_sequences = torch.zeros(
             (self.batch_size, out_ctx_len),
-            device='cpu', dtype=torch.int64, pin_memory=True,
+            device='cpu', dtype=torch.int64, pin_memory=HAS_PIN_MEMORY,
         )
         prev_shifts = self.prev_shifts.to('cpu')
         for i, info in enumerate(self.sequences):
+            if info.ended:
+                # if ended, leave in/out as 0
+                continue
+
             # write short ctx
             short_ctx = torch.tensor(info.sequence[info.offset : info.offset + short_ctx_len], device='cpu')
             # apply short ctx dropout, skip control tokens
@@ -261,7 +275,13 @@ class TrainBatch:
         pos_weighted_losses_mean = (pos_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
         full_weighted_losses_mean = (full_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
 
-        return next_recurrent, tokens_out, embeddings_out, full_weighted_losses_mean, \
+        # sample token for tokens_out
+        tokens_out_sampled = (tokens_out / self.train_config.drift_sample_temperature) \
+            .softmax(dim=-1) \
+            .multinomial(1) \
+            .squeeze(-1)
+
+        return next_recurrent, tokens_out_sampled, embeddings_out, full_weighted_losses_mean, \
             pos_weighted_losses_mean, next_shifts, out_drift
 
     def forward_step(self):
@@ -270,7 +290,7 @@ class TrainBatch:
         input_short_ctx, committed_mask, expected_output = self.prepare_batch()
 
         next_recurrent, tokens_out, embeddings_out, full_weighted_lossses, \
-            pos_weighted_losses, next_shifts, out_drift = \
+            pos_weighted_losses, next_shifts, _out_drift = \
             self.forward_batch(
                 self.recurrent,
                 input_short_ctx,
@@ -278,7 +298,7 @@ class TrainBatch:
                 expected_output,
                 self.prev_shifts,
                 self.prev_output_embeddings,
-                active_batches,
+                self.active_batches,
             )
 
         if isinstance(DEBUG_RECURRENT_GRAD, list):
@@ -287,30 +307,39 @@ class TrainBatch:
         self.recurrent = next_recurrent
         self.prev_output_embeddings = embeddings_out
         self.prev_output_tokens = tokens_out.to('cpu', non_blocking=True)
-        self.prev_shifts = next_shifts
-        ended_count = 0
+        next_shifts_cpu = next_shifts.to('cpu', non_blocking=True)
 
+        self.losses.append(full_weighted_lossses)
+        self.pos_weighted_losses.append(pos_weighted_losses)
+
+        ended_count = 0
+        active_batches = torch.full((self.batch_size,), True, device='cpu', pin_memory=HAS_PIN_MEMORY)
         for i, info in enumerate(self.sequences):
             if info.ended:
                 # skip finished sequences
+                active_batches[i] = False
                 ended_count += 1
                 continue
 
-            info.losses.append(weighted_losses[i])
-
-            info.prev_halted = did_halt_cpu[i]
-            if info.prev_halted:
-                # record unweighted loss as well
-                info.halted_losses.append(cross_entropy_cpu[i])
-
-                # check if sequence ended
-                # we end when the model advances past the end padding
-                if offset >= len(info.sequence) - (short_ctx_len + out_ctx_len):
+            shift = typing.cast(int, next_shifts_cpu[i].item())
+            if shift > 0:
+                last_offset = len(info.sequence) - (short_ctx_len + out_ctx_len)
+                if info.offset >= last_offset:
+                    # mark sequence ended when offset is at the end and a shift occurs
                     info.ended = True
+                    active_batches[i] = False
                     ended_count += 1
+                elif info.offset + shift > last_offset:
+                    # if a shift would exceed the end, clip it to the end
+                    clipped_shift = last_offset - info.offset
+                    next_shifts_cpu[i] = clipped_shift
+                    info.offset += clipped_shift
                 else:
-                    # slide shortctx to include next token
-                    info.offset += 1
+                    # advance sequence
+                    info.offset += shift
+
+        self.active_batches = active_batches.to(self.device, non_blocking=True)
+        self.prev_shifts = next_shifts_cpu.to(self.device, non_blocking=True)
 
         return ended_count
 
@@ -328,6 +357,8 @@ class TrainHelper:
 
     train_loss: float = 0.0
     "Train loss for current step"
+    pos_weighted_loss: float = 0.0
+    "Position weighted loss for current step"
 
     def __init__(
         self,
@@ -341,7 +372,6 @@ class TrainHelper:
         self.device = device
         self.dtype = dtype
         self.sequence_provider = None
-        self.prev_unweighted_losses = []
 
         self.model = RNN(model_config)
         self.model.type(self.dtype)
@@ -350,10 +380,6 @@ class TrainHelper:
 
         self.batch_count = self.train_config.accumulate_gradients
         self.batches = []
-
-        # 16 steps is a very arbitrary number
-        self.ponder_adjust_lookback = self.train_config.batch_size * \
-            self.train_config.accumulate_gradients * 16
 
     def prepare(self):
         assert self.sequence_provider is not None
@@ -391,30 +417,30 @@ class TrainHelper:
             print(i, end=' ', flush=True)
 
         print('done')
-        return self.train_loss
+        return self.train_loss, self.pos_weighted_loss
 
     def step_single(self, batch: TrainBatch):
         # forward step TODO:
         should_new_seq = True
         for i in range(self.train_config.truncate_steps):
-            is_last_step = i == self.train_config.truncate_steps - 1
-            done_count = batch.forward_step(force_halt=is_last_step)
+            done_count = batch.forward_step()
             if done_count >= batch.batch_size / 2:
                 should_new_seq = True
                 break
 
         # run loss
         seq_proportion = batch.batch_size * self.batch_count
-        train_losses = list(batch.iter_train_losses())
-        train_loss = torch.stack(train_losses).sum() / seq_proportion
+        train_loss = torch.stack(batch.losses).sum() / seq_proportion
         self.train_loss += train_loss.item()
+
+        pos_weighted_loss = torch.stack(batch.pos_weighted_losses).sum() / seq_proportion
+        self.pos_weighted_loss += pos_weighted_loss.item()
 
         # backward step
         train_loss.backward()
 
         if should_new_seq:
             # if enough sequences have ended, get new ones
-            print('(ns)', end='')
             batch.initialize_sequences()
         else:
             # continue with current sequences
@@ -500,7 +526,6 @@ def main():
         print('unknown subcommand:', subcommand)
         return
 
-    # TODO: temp hack
     data_iter = filter_text(load_dataset(open(data_path, 'rb')))
     trainer.sequence_provider = SequenceProvider(data_iter)
 
@@ -556,11 +581,11 @@ def main():
         #     batch += 1
 
         print('\nstep:', step)
-        train_loss_f, unweighted_loss_f = trainer.step_all()
+        train_loss_f, pos_weighted_loss_f = trainer.step_all()
         print('training loss:', train_loss_f)
-        print('unweighted loss:', unweighted_loss_f)
+        print('position weighted loss:', pos_weighted_loss_f)
         trainer.track(train_loss_f, name='train_loss', step=step)
-        trainer.track(unweighted_loss_f, name='unweighted_loss', step=step)
+        trainer.track(pos_weighted_loss_f, name='pos_weighted_loss', step=step)
 
         grad_norm_f = nn.utils.clip_grad_norm_(
             model.parameters(),
