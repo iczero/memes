@@ -260,11 +260,11 @@ class TrainBatch:
         drift_commit_p = drift_commit_p.maximum(torch.tensor(self.train_config.drift_commit_p_min))
 
         drift_committed = drift_commit_p.bernoulli()
-        # find first uncommitted index, or out_ctx_len if all are committed somehow
+        # find first uncommitted index, or out_ctx_len if all are committed
         next_shifts = torch.where(
             (drift_committed - 1).sum(dim=-1) == 0.,
-            torch.argmax(drift_committed * -1, dim=-1),
             out_ctx_len,
+            torch.argmax(drift_committed * -1, dim=-1),
         )
 
         # weight both
@@ -418,6 +418,7 @@ class TrainHelper:
 
     def step_all(self):
         self.train_loss = 0
+        self.pos_weighted_loss = 0
         print('batch: ', end='', flush=True)
         for i, batch in enumerate(self.batches):
             self.step_single(batch)
