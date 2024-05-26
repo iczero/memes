@@ -291,7 +291,7 @@ class TrainBatch:
         return next_recurrent, tokens_out_sampled, embeddings_out, full_weighted_losses_mean, \
             pos_weighted_losses_mean, next_shifts, out_drift
 
-    def forward_step(self):
+    def forward_step(self, dump=False):
         short_ctx_len = self.model_config.short_ctx_len
         out_ctx_len = self.model_config.out_ctx_len
         input_short_ctx, committed_mask, expected_output = self.prepare_batch()
@@ -327,6 +327,9 @@ class TrainBatch:
                 active_batches[i] = False
                 ended_count += 1
                 continue
+
+            if dump:
+                print('batch', i, 'in', dump_sequence(input_short_ctx[i]), 'out', dump_sequence(tokens_out[i]))
 
             shift = typing.cast(int, next_shifts_cpu[i].item())
             if shift > 0:
@@ -416,22 +419,24 @@ class TrainHelper:
         if self.aim_run is not None:
             self.aim_run.track(value, name, step, epoch, context=context) # type: ignore
 
-    def step_all(self):
+    def step_all(self, dump = False):
         self.train_loss = 0
         self.pos_weighted_loss = 0
         print('batch: ', end='', flush=True)
         for i, batch in enumerate(self.batches):
-            self.step_single(batch)
+            should_dump = dump and i == 0
+            self.step_single(batch, should_dump)
             print(i, end=' ', flush=True)
 
         print('done')
         return self.train_loss, self.pos_weighted_loss
 
-    def step_single(self, batch: TrainBatch):
+    def step_single(self, batch: TrainBatch, dump = False):
         # forward step TODO:
         should_new_seq = True
         for i in range(self.train_config.truncate_steps):
-            done_count = batch.forward_step()
+            should_dump = dump and i == self.train_config.truncate_steps / 2
+            done_count = batch.forward_step(should_dump)
             if done_count >= batch.batch_size / 2:
                 should_new_seq = True
                 break
@@ -496,7 +501,7 @@ def main():
 
         dtype = model_config.get_dtype()
         trainer = TrainHelper(model_config, train_config, device, dtype)
-        trainer.aim_run = aim.Run()
+        trainer.aim_run = aim.Run(experiment='rnn')
         trainer.aim_run['model_config'] = model_config.to_dict()
         trainer.aim_run['train_config'] = train_config.to_dict()
 
@@ -517,7 +522,7 @@ def main():
         if 'run_hash' in loaded:
             trainer.aim_run = aim.Run(run_hash=loaded['run_hash'])
         else:
-            trainer.aim_run = aim.Run()
+            trainer.aim_run = aim.Run(experiment='rnn')
             trainer.aim_run['model_config'] = model_config.to_dict()
             trainer.aim_run['train_config'] = train_config.to_dict()
 
@@ -589,7 +594,8 @@ def main():
         #     batch += 1
 
         print('\nstep:', step)
-        train_loss_f, pos_weighted_loss_f = trainer.step_all()
+        should_dump = step % 25 == 0
+        train_loss_f, pos_weighted_loss_f = trainer.step_all(should_dump)
         print('training loss:', train_loss_f)
         print('position weighted loss:', pos_weighted_loss_f)
         trainer.track(train_loss_f, name='train_loss', step=step)

@@ -1,26 +1,13 @@
 import math
 
+import aim
 import torch
+import torch._dynamo.config
+import torch.nn.functional as F
 from torch import nn
-from torch.nn import functional as F
 
-from .common import ModelConfig
-#from .rotary_encoding import RotaryEncoding
-
-# def oh_no(x: torch.Tensor):
-#     "oh no"
-#     if x.abs().max() > 1e12:
-#         print(x)
-#         print('offending value:', x.abs().max())
-#         raise RuntimeError('detected very large value(s)')
-#     if not torch.all(torch.isfinite(x)).item():
-#         if torch.any(torch.isnan(x)).item():
-#             print('detected nan values')
-#         if torch.any(torch.isinf(x)).item():
-#             print('detected +/-inf values')
-#
-#         print(x)
-#         raise RuntimeError('non-finite values detected')
+from .common import ControlTokens, ModelConfig, dump_sequence
+from .data import SequenceProvider, filter_text, load_dataset
 
 class GLU(nn.Module):
     def __init__(self, in_dim, out_dim, activation, bias=True):
@@ -280,7 +267,7 @@ class CharDecode(nn.Module):
         logits_out = self.w_out(embeddings_out)
         return embeddings_out, logits_out
 
-class RNN(nn.Module):
+class Autoencoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
@@ -301,10 +288,107 @@ class RNN(nn.Module):
         inputs_committed: torch.Tensor,
     ):
         recurrent = recurrent + self.input(recurrent, inputs, inputs_committed)
-        for layer in self.intermediate:
-            recurrent = recurrent + layer(recurrent)
+        recurrent = recurrent + self.input(recurrent, inputs, inputs_committed)
+        if len(self.intermediate) > 0:
+            for layer in self.intermediate:
+                recurrent = recurrent + layer(recurrent)
 
         output = self.pre_output(recurrent)
         embeddings_out, logits_out = self.char_decode(output)
 
         return recurrent, embeddings_out, logits_out
+
+def to_bytes_list(s: str) -> list[int]:
+    return list(s.encode('utf-8'))
+
+def make_param_groups(named_parameters):
+    exclude_wd = []
+    default = []
+    for name, param in named_parameters:
+        if len(param.shape) < 2 or name.endswith('.recurrent_init') \
+                or name.endswith('.bias') or name.endswith('.out_query') \
+                or name.endswith('.positional_encodings'):
+            exclude_wd.append(param)
+        else:
+            default.append(param)
+
+    return [
+        { 'params': exclude_wd, 'weight_decay': 0.0 },
+        { 'params': default },
+    ]
+
+def main():
+    run = aim.Run()
+    run.experiment = 'autoencoder-test'
+    run.name = 'autoencoder-3.0'
+
+    model_config = ModelConfig(
+        d_embed=128,
+        n_attention_heads=5,
+        n_streams=24,
+        ff_dropout_p=0.0,
+        attn_dropout_p=0.0,
+        n_intermediate=1,
+        resid_gate_multiplier=1.0,
+        d_ff_inner=512,
+        activation='gelu',
+        dtype='float32',
+        qkv_bias=True,
+        short_ctx_len=0,
+        out_ctx_len=128,
+    )
+    batch_size = 1024
+
+    data_path = '/mnt/data/opt/the-pile/train/00.jsonl.zst'
+    data_iter = filter_text(load_dataset(open(data_path, 'rb')))
+    def slice_stuff(data, target_len: int):
+        for el in data:
+            bytes_list = to_bytes_list(el)
+            if len(bytes_list) < target_len:
+                continue
+
+            yield bytes_list[:target_len]
+
+    data_iter = slice_stuff(data_iter, model_config.out_ctx_len)
+
+    device = torch.device('cuda')
+    model = Autoencoder(model_config)
+    model.to(device=device, dtype=model_config.get_dtype())
+
+    optimizer = torch.optim.AdamW(
+        make_param_groups(model.named_parameters()),
+        lr=1e-4,
+        weight_decay=0.05
+    )
+
+    committed_mask = torch.full((batch_size, model_config.out_ctx_len), True, device=device)
+    step = 0
+    while True:
+        step += 1
+        print('step:', step)
+        sequences = torch.tensor([next(data_iter) for n in range(batch_size)])
+        sequences = sequences.to(device)
+
+        optimizer.zero_grad()
+        _, _, output = model(model.recurrent_init.unsqueeze(0) \
+            .repeat_interleave(batch_size, dim=0), sequences, committed_mask)
+        loss = F.cross_entropy(output.transpose(-2, -1), sequences, reduction='mean')
+        loss.backward()
+        grad_norm_f = nn.utils.clip_grad_norm_(
+            model.parameters(),
+            15.0,
+            error_if_nonfinite=True,
+        ).item()
+        optimizer.step()
+
+        run.track(loss.item(), name='loss', step=step)
+        run.track(grad_norm_f, name='grad_norm', step=step)
+
+        if step % 25 == 0:
+            for i in range(10):
+                seq_in = dump_sequence(sequences[i])
+                seq_out = dump_sequence(output[i].argmax(dim=-1))
+                print('batch', i, 'in', seq_in, 'out', seq_out)
+
+if __name__ == '__main__':
+    main()
