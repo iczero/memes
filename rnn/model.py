@@ -258,21 +258,19 @@ class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_embed = config.d_embed
-        self.query_base = nn.Parameter(torch.randn((config.d_embed,)))
-        self.rope = RotaryEncoding(config.d_embed, config.out_ctx_len)
+        self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, config.d_embed,)))
         self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2, bias=config.qkv_bias)
 
         self.feedforward = GLU(config.d_embed, config.d_embed, config.get_activation())
         self.w_out = nn.Linear(config.d_embed, config.vocab_size)
 
-    def forward(self, x: torch.Tensor, output_count: int):
+    def forward(self, x: torch.Tensor):
         kv_merged = self.kv_linear(x).unflatten(-1, (2, self.d_embed))
         # kv_merged: (batch, stream, 2, n_embed)
         # no transpose since we have no n_heads
         k = kv_merged[..., 0, :]
         v = kv_merged[..., 1, :]
-        # build queries: repeat query_base for output_count then apply encoding
-        q = self.rope(self.query_base.unsqueeze(0).repeat_interleave(output_count, 0))
+        q = self.out_query
 
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
@@ -299,13 +297,12 @@ class RNN(nn.Module):
         recurrent: torch.Tensor,
         inputs: torch.Tensor,
         inputs_committed: torch.Tensor,
-        output_count: int,
     ):
         recurrent = recurrent + self.input(recurrent, inputs, inputs_committed)
         for layer in self.intermediate:
             recurrent = recurrent + layer(recurrent)
 
         output = self.pre_output(recurrent)
-        embeddings_out, logits_out = self.char_decode(output, output_count)
+        embeddings_out, logits_out = self.char_decode(output)
 
         return recurrent, embeddings_out, logits_out

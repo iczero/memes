@@ -234,7 +234,7 @@ class TrainBatch:
         out_ctx_len = self.model_config.out_ctx_len
         # forward model
         next_recurrent, embeddings_out, token_logits_out = \
-            self.model(recurrent, input_sequence, committed_mask, self.model_config.out_ctx_len)
+            self.model(recurrent, input_sequence, committed_mask)
 
         # calculate losses
         # needs transpose due to cross_entropy shape expectations

@@ -136,7 +136,7 @@ class TrainConfig:
             short_ctx_dropout_p=float(obj['short_ctx_dropout_p']),
             drift_commit_p_scale=float(obj['drift_commit_p_scale']),
             drift_commit_p_min=float(obj['drift_commit_p_min']),
-            drift_sample_temperature=float(obj['drift_sample_temperature']),
+            drift_sample_temperature=float(obj['drift_sample_temperature'])
         )
 
     def to_dict(self):
@@ -146,7 +146,8 @@ class TrainConfig:
         exclude_wd = []
         default = []
         for name, param in named_parameters:
-            if len(param.shape) < 2 or name.endswith('.recurrent_init') or name.endswith('.bias'):
+            if len(param.shape) < 2 or name.endswith('.recurrent_init') \
+                    or name.endswith('.bias') or name.endswith('.out_query'):
                 exclude_wd.append(param)
             else:
                 default.append(param)
