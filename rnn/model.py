@@ -7,6 +7,21 @@ from torch.nn import functional as F
 from .common import ModelConfig
 from .rotary_encoding import RotaryEncoding
 
+# def oh_no(x: torch.Tensor):
+#     "oh no"
+#     if x.abs().max() > 1e12:
+#         print(x)
+#         print('offending value:', x.abs().max())
+#         raise RuntimeError('detected very large value(s)')
+#     if not torch.all(torch.isfinite(x)).item():
+#         if torch.any(torch.isnan(x)).item():
+#             print('detected nan values')
+#         if torch.any(torch.isinf(x)).item():
+#             print('detected +/-inf values')
+#
+#         print(x)
+#         raise RuntimeError('non-finite values detected')
+
 class GLU(nn.Module):
     def __init__(self, in_dim, out_dim, activation, bias=True):
         super().__init__()
@@ -59,6 +74,8 @@ class BatchGLU(nn.Module):
 
     def forward(self, x: torch.Tensor):
         mid_1, mid_2 = self.w_in(x).split(self.d_mid, dim=-1)
+        # print('mid_1 max:', mid_1.abs().max())
+        # print('mid_2 max:', mid_2.abs().max())
         mid = self.activation(mid_1) * mid_2
         return self.w_out(mid)
 
@@ -77,7 +94,7 @@ class CrossAttentionInput(nn.Module):
         self.input_embedding = nn.Embedding(config.vocab_size, config.d_embed)
         # marker for uncommitted
         self.uncommitted_marker = nn.Parameter(torch.randn((config.d_embed,)))
-        self.norm = nn.LayerNorm((config.d_embed))
+        self.recurrent_norm = nn.LayerNorm([config.d_embed])
         self.q_linear = BatchLinear(
             config.n_streams,
             config.d_embed,
@@ -101,7 +118,8 @@ class CrossAttentionInput(nn.Module):
             activation=config.get_activation(),
         )
 
-    def forward(self, current: torch.Tensor, inputs: torch.Tensor, committed: torch.Tensor):
+    def forward(self, recurrent: torch.Tensor, inputs: torch.Tensor, committed: torch.Tensor):
+        recurrent_norm = self.recurrent_norm(recurrent)
         # (batch, stream) -> (batch, stream, d_embed)
         inputs_embed = self.input_embedding(inputs)
         # mark uncommitted positions
@@ -109,7 +127,7 @@ class CrossAttentionInput(nn.Module):
         # apply rotary embedding to byte embeddings directly
         inputs_embed = self.rope(inputs_embed)
 
-        q = self.q_linear(self.norm(current)) \
+        q = self.q_linear(recurrent_norm) \
             .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
             .transpose(-2, -3)
         # kv_merged: (batch, stream, 2 (k/v), n_heads, d_embed)
@@ -122,7 +140,7 @@ class CrossAttentionInput(nn.Module):
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
         # add skip
-        attn_out = torch.cat((attn_out, current.unsqueeze(-2)), dim=-2)
+        attn_out = torch.cat((attn_out, recurrent_norm.unsqueeze(-2)), dim=-2)
         # scale heads
         attn_out = self.head_scales.unsqueeze(-1) * attn_out
 
@@ -140,7 +158,7 @@ class Intermediate(nn.Module):
         self.n_attention_heads = config.n_attention_heads
         self.resid_gate_multiplier = config.resid_gate_multiplier
 
-        self.norm = nn.LayerNorm((config.d_embed))
+        self.norm = nn.LayerNorm([config.d_embed])
         self.q_linear = BatchLinear(
             config.n_streams,
             config.d_embed,
@@ -194,7 +212,7 @@ class PreOutput(nn.Module):
         self.d_embed = config.d_embed
         self.n_attention_heads = config.n_attention_heads
 
-        self.norm = nn.LayerNorm((config.d_embed))
+        self.norm = nn.LayerNorm([config.d_embed])
         self.q_linear = BatchLinear(
             config.n_streams,
             config.d_embed,
@@ -265,13 +283,16 @@ class CharDecode(nn.Module):
 class RNN(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.recurrent_init = nn.Parameter(torch.randn(config.n_streams, config.d_embed))
+        self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
         self.input = CrossAttentionInput(config)
         self.intermediate = nn.ModuleList(
             Intermediate(config) for _ in range(config.n_intermediate)
         )
         self.pre_output = PreOutput(config)
         self.char_decode = CharDecode(config)
+
+        init_bound = 1 / math.sqrt(config.d_embed)
+        nn.init.uniform_(self.recurrent_init, -init_bound, init_bound)
 
     def forward(
         self,
