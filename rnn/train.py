@@ -329,7 +329,9 @@ class TrainBatch:
                 continue
 
             if dump:
-                print('batch', i, 'in', dump_sequence(input_short_ctx[i]), 'out', dump_sequence(tokens_out[i]))
+                batch_text = f'batch {i}'
+                print(batch_text, 'in ', dump_sequence(input_short_ctx[i]))
+                print(' ' * len(batch_text), 'out', dump_sequence(tokens_out[i]))
 
             shift = typing.cast(int, next_shifts_cpu[i].item())
             if shift > 0:
@@ -442,7 +444,7 @@ class TrainHelper:
                 break
 
         # run loss
-        seq_proportion = batch.batch_size * self.batch_count
+        seq_proportion = len(batch.losses) * self.batch_count
         train_loss = torch.stack(batch.losses).sum() / seq_proportion
         self.train_loss += train_loss.item()
 
