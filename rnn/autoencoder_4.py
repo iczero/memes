@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.1.1'
+    run.name = 'autoencoder-4.1.2'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -356,7 +356,7 @@ def main():
 
     optimizer = torch.optim.AdamW(
         make_param_groups(model.named_parameters()),
-        lr=1e-4,
+        lr=5e-5,
         weight_decay=0.05
     )
 
