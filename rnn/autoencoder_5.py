@@ -254,7 +254,7 @@ class CharDecode(nn.Module):
         self.kv_linear = nn.Linear(config.d_embed, config.d_embed * N_DECODE_HEADS * 2, bias=config.qkv_bias)
         self.head_scales = nn.Parameter(torch.ones((N_DECODE_HEADS,)))
 
-        self.feedforward = GLU(config.d_embed * N_DECODE_HEADS, D_DECODE_INNER, config.get_activation())
+        self.feedforward = GLU(config.d_embed * N_DECODE_HEADS, D_DECODE_INNER, nn.ReLU())
         self.w_out = nn.Linear(D_DECODE_INNER, config.vocab_size)
 
     def forward(self, x: torch.Tensor):
@@ -324,7 +324,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-5'
+    run.name = 'autoencoder-5.1'
 
     model_config = ModelConfig(
         d_embed=128,
