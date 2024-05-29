@@ -271,11 +271,11 @@ class Autoencoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
-        self.input1 = CrossAttentionInput(config)
-        self.int1 = Intermediate(config)
+        self.input0 = CrossAttentionInput(config)
+        self.output1 = PreOutput(config)
         self.int2 = Intermediate(config)
         self.int3 = Intermediate(config)
-        self.int4 = Intermediate(config)
+        self.output4 = PreOutput(config)
         self.char_decode = CharDecode(config)
 
         init_bound = 1 / math.sqrt(config.d_embed)
@@ -287,11 +287,11 @@ class Autoencoder(nn.Module):
         inputs: torch.Tensor,
         inputs_committed: torch.Tensor,
     ):
-        recurrent = recurrent + self.input1(recurrent, inputs, inputs_committed)
-        recurrent = recurrent + self.int1(recurrent)
+        recurrent = recurrent + self.input0(recurrent, inputs, inputs_committed)
+        recurrent = self.output1(recurrent)
         recurrent = recurrent + self.int2(recurrent)
         recurrent = recurrent + self.int3(recurrent)
-        recurrent = recurrent + self.int4(recurrent)
+        recurrent = self.output4(recurrent)
 
         embeddings_out, logits_out = self.char_decode(recurrent)
 
@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.2'
+    run.name = 'autoencoder-4.3'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -389,7 +389,7 @@ def main():
                 seq_out = dump_sequence(output[i].argmax(dim=-1))
 
                 text1 = f'batch {i}'
-                print(f'{text1} in {seq_in}')
+                print(f'{text1} in  {seq_in}')
                 print(f'{" " * len(text1)} out {seq_out}')
 
 if __name__ == '__main__':
