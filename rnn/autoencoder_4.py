@@ -6,8 +6,8 @@ import torch._dynamo.config
 import torch.nn.functional as F
 from torch import nn
 
-from .common import ControlTokens, ModelConfig, dump_sequence
-from .data import SequenceProvider, filter_text, load_dataset
+from .common import ModelConfig, dump_sequence
+from .data import filter_text, load_dataset
 
 class GLU(nn.Module):
     def __init__(self, in_dim, out_dim, activation, bias=True):
@@ -271,10 +271,10 @@ class Autoencoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
-        self.input = CrossAttentionInput(config)
-        self.intermediate = nn.ModuleList(
-            Intermediate(config) for _ in range(config.n_intermediate)
-        )
+        self.input1 = CrossAttentionInput(config)
+        self.int1 = Intermediate(config)
+        self.input2 = CrossAttentionInput(config)
+        self.int2 = Intermediate(config)
         self.pre_output = PreOutput(config)
         self.char_decode = CharDecode(config)
 
@@ -287,10 +287,10 @@ class Autoencoder(nn.Module):
         inputs: torch.Tensor,
         inputs_committed: torch.Tensor,
     ):
-        recurrent = recurrent + self.input(recurrent, inputs, inputs_committed)
-        if len(self.intermediate) > 0:
-            for layer in self.intermediate:
-                recurrent = recurrent + layer(recurrent)
+        recurrent = recurrent + self.input1(recurrent, inputs, inputs_committed)
+        recurrent = recurrent + self.int1(recurrent)
+        recurrent = recurrent + self.input2(recurrent, inputs, inputs_committed)
+        recurrent = recurrent + self.int2(recurrent)
 
         output = self.pre_output(recurrent)
         embeddings_out, logits_out = self.char_decode(output)
@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-1.2'
+    run.name = 'autoencoder-4.0'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -327,7 +327,7 @@ def main():
         n_streams=32,
         ff_dropout_p=0.0,
         attn_dropout_p=0.0,
-        n_intermediate=1,
+        n_intermediate=0,
         resid_gate_multiplier=1.0,
         d_ff_inner=512,
         activation='gelu',
@@ -336,7 +336,7 @@ def main():
         short_ctx_len=0,
         out_ctx_len=128,
     )
-    batch_size = 1024
+    batch_size = 128
 
     data_path = '/mnt/data/opt/the-pile/train/00.jsonl.zst'
     data_iter = filter_text(load_dataset(open(data_path, 'rb')))
