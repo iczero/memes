@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.3'
+    run.name = 'autoencoder-4.3.1'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -375,7 +375,7 @@ def main():
         loss.backward()
         grad_norm_f = nn.utils.clip_grad_norm_(
             model.parameters(),
-            30.0,
+            50.0,
             error_if_nonfinite=True,
         ).item()
         optimizer.step()
