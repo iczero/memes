@@ -274,7 +274,7 @@ class Autoencoder(nn.Module):
         self.input0 = CrossAttentionInput(config)
         self.output1 = PreOutput(config)
         self.int2 = Intermediate(config)
-        self.int3 = Intermediate(config)
+        self.output3 = PreOutput(config)
         self.output4 = PreOutput(config)
         self.char_decode = CharDecode(config)
 
@@ -290,7 +290,7 @@ class Autoencoder(nn.Module):
         recurrent = recurrent + self.input0(recurrent, inputs, inputs_committed)
         recurrent = self.output1(recurrent)
         recurrent = recurrent + self.int2(recurrent)
-        recurrent = recurrent + self.int3(recurrent)
+        recurrent = self.output3(recurrent)
         recurrent = self.output4(recurrent)
 
         embeddings_out, logits_out = self.char_decode(recurrent)
@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.3.1'
+    run.name = 'autoencoder-4.5'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -392,7 +392,7 @@ def main():
                 print(f'{text1} in  {seq_in}')
                 print(f'{" " * len(text1)} out {seq_out}')
 
-        if step >= 5000:
+        if step % 5000 == 0:
             from IPython import start_ipython
             start_ipython(argv=[], user_ns=locals() | globals())
 
