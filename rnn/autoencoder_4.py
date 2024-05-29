@@ -275,7 +275,7 @@ class Autoencoder(nn.Module):
         self.int1 = Intermediate(config)
         self.int2 = Intermediate(config)
         self.int3 = Intermediate(config)
-        self.pre_output = PreOutput(config)
+        self.int4 = Intermediate(config)
         self.char_decode = CharDecode(config)
 
         init_bound = 1 / math.sqrt(config.d_embed)
@@ -291,9 +291,9 @@ class Autoencoder(nn.Module):
         recurrent = recurrent + self.int1(recurrent)
         recurrent = recurrent + self.int2(recurrent)
         recurrent = recurrent + self.int3(recurrent)
+        recurrent = recurrent + self.int4(recurrent)
 
-        output = self.pre_output(recurrent)
-        embeddings_out, logits_out = self.char_decode(output)
+        embeddings_out, logits_out = self.char_decode(recurrent)
 
         return recurrent, embeddings_out, logits_out
 
@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.1'
+    run.name = 'autoencoder-4.2'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -375,7 +375,7 @@ def main():
         loss.backward()
         grad_norm_f = nn.utils.clip_grad_norm_(
             model.parameters(),
-            15.0,
+            30.0,
             error_if_nonfinite=True,
         ).item()
         optimizer.step()
@@ -387,7 +387,10 @@ def main():
             for i in range(10):
                 seq_in = dump_sequence(sequences[i])
                 seq_out = dump_sequence(output[i].argmax(dim=-1))
-                print('batch', i, 'in', seq_in, 'out', seq_out)
+
+                text1 = f'batch {i}'
+                print(f'{text1} in {seq_in}')
+                print(f'{" " * len(text1)} out {seq_out}')
 
 if __name__ == '__main__':
     main()
