@@ -243,27 +243,32 @@ class PreOutput(nn.Module):
         ff_out = self.feedforward(attn_concat)
         return ff_out
 
+N_DECODE_HEADS = 2
+D_DECODE_INNER = 256
+
 class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_embed = config.d_embed
-        self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, config.d_embed,)))
-        self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2, bias=config.qkv_bias)
+        self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, N_DECODE_HEADS, config.d_embed,)))
+        self.kv_linear = nn.Linear(config.d_embed, config.d_embed * N_DECODE_HEADS * 2, bias=config.qkv_bias)
+        self.head_scales = nn.Parameter(torch.ones((N_DECODE_HEADS,)))
 
-        self.feedforward = GLU(config.d_embed, config.d_embed, config.get_activation())
-        self.w_out = nn.Linear(config.d_embed, config.vocab_size)
+        self.feedforward = GLU(config.d_embed * N_DECODE_HEADS, D_DECODE_INNER, config.get_activation())
+        self.w_out = nn.Linear(D_DECODE_INNER, config.vocab_size)
 
     def forward(self, x: torch.Tensor):
-        kv_merged = self.kv_linear(x).unflatten(-1, (2, self.d_embed))
-        # kv_merged: (batch, stream, 2, n_embed)
-        # no transpose since we have no n_heads
-        k = kv_merged[..., 0, :]
-        v = kv_merged[..., 1, :]
-        q = self.out_query
+        kv_merged = self.kv_linear(x).unflatten(-1, (2, N_DECODE_HEADS, self.d_embed))
+        # kv_merged: (batch, stream, 2, n_heads, n_embed)
+        k = kv_merged[..., 0, :, :].transpose(-2, -3)
+        v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        q = self.out_query.transpose(-2, -3)
 
         # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v)
-        embeddings_out = self.feedforward(attn_out)
+        attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
+        attn_out = self.head_scales.unsqueeze(-1) * attn_out
+        attn_concat = attn_out.flatten(-2, -1)
+        embeddings_out = self.feedforward(attn_concat)
         logits_out = self.w_out(embeddings_out)
         return embeddings_out, logits_out
 
@@ -319,7 +324,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.1.1'
+    run.name = 'autoencoder-5'
 
     model_config = ModelConfig(
         d_embed=128,
