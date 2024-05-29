@@ -273,8 +273,8 @@ class Autoencoder(nn.Module):
         self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
         self.input1 = CrossAttentionInput(config)
         self.int1 = Intermediate(config)
-        self.input2 = CrossAttentionInput(config)
         self.int2 = Intermediate(config)
+        self.int3 = Intermediate(config)
         self.pre_output = PreOutput(config)
         self.char_decode = CharDecode(config)
 
@@ -289,8 +289,8 @@ class Autoencoder(nn.Module):
     ):
         recurrent = recurrent + self.input1(recurrent, inputs, inputs_committed)
         recurrent = recurrent + self.int1(recurrent)
-        recurrent = recurrent + self.input2(recurrent, inputs, inputs_committed)
         recurrent = recurrent + self.int2(recurrent)
+        recurrent = recurrent + self.int3(recurrent)
 
         output = self.pre_output(recurrent)
         embeddings_out, logits_out = self.char_decode(output)
@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.0'
+    run.name = 'autoencoder-4.1'
 
     model_config = ModelConfig(
         d_embed=128,
