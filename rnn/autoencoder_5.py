@@ -245,6 +245,7 @@ class PreOutput(nn.Module):
 
 N_DECODE_HEADS = 2
 D_DECODE_INNER = 256
+D_DECODE_POS = 4
 
 class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -253,8 +254,9 @@ class CharDecode(nn.Module):
         self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, N_DECODE_HEADS, config.d_embed,)))
         self.kv_linear = nn.Linear(config.d_embed, config.d_embed * N_DECODE_HEADS * 2, bias=config.qkv_bias)
         self.head_scales = nn.Parameter(torch.ones((N_DECODE_HEADS,)))
+        self.out_pos = nn.Parameter(torch.randn((config.out_ctx_len, D_DECODE_POS)))
 
-        self.feedforward = GLU(config.d_embed * N_DECODE_HEADS, D_DECODE_INNER, nn.ReLU())
+        self.feedforward = GLU(config.d_embed * N_DECODE_HEADS + D_DECODE_POS, D_DECODE_INNER, config.get_activation())
         self.w_out = nn.Linear(D_DECODE_INNER, config.vocab_size)
 
     def forward(self, x: torch.Tensor):
@@ -268,6 +270,7 @@ class CharDecode(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
         attn_out = self.head_scales.unsqueeze(-1) * attn_out
         attn_concat = attn_out.flatten(-2, -1)
+        attn_concat = torch.cat((attn_concat, self.out_pos.expand((attn_concat.shape[0], -1, -1))), dim=-1)
         embeddings_out = self.feedforward(attn_concat)
         logits_out = self.w_out(embeddings_out)
         return embeddings_out, logits_out
@@ -311,7 +314,7 @@ def make_param_groups(named_parameters):
     for name, param in named_parameters:
         if len(param.shape) < 2 or name.endswith('.recurrent_init') \
                 or name.endswith('.bias') or name.endswith('.out_query') \
-                or name.endswith('.positional_encodings'):
+                or name.endswith('.positional_encodings') or name.endswith('.out_pos'):
             exclude_wd.append(param)
         else:
             default.append(param)
@@ -324,7 +327,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-5.1'
+    run.name = 'autoencoder-5.2'
 
     model_config = ModelConfig(
         d_embed=128,
