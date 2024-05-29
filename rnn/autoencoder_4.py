@@ -272,9 +272,9 @@ class Autoencoder(nn.Module):
         super().__init__()
         self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
         self.input0 = CrossAttentionInput(config)
-        self.int1 = Intermediate(config)
+        self.output1 = PreOutput(config)
         self.int2 = Intermediate(config)
-        self.output3 = PreOutput(config)
+        self.int3 = Intermediate(config)
         self.output4 = PreOutput(config)
         self.char_decode = CharDecode(config)
 
@@ -288,9 +288,9 @@ class Autoencoder(nn.Module):
         inputs_committed: torch.Tensor,
     ):
         recurrent = recurrent + self.input0(recurrent, inputs, inputs_committed)
-        recurrent = recurrent + self.int1(recurrent)
+        recurrent = self.output1(recurrent)
         recurrent = recurrent + self.int2(recurrent)
-        recurrent = self.output3(recurrent)
+        recurrent = recurrent + self.int3(recurrent)
         recurrent = self.output4(recurrent)
 
         embeddings_out, logits_out = self.char_decode(recurrent)
@@ -319,7 +319,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.4'
+    run.name = 'autoencoder-4.3'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -391,6 +391,10 @@ def main():
                 text1 = f'batch {i}'
                 print(f'{text1} in  {seq_in}')
                 print(f'{" " * len(text1)} out {seq_out}')
+
+        if step >= 5000:
+            from IPython import start_ipython
+            start_ipython(argv=[], user_ns=locals() | globals())
 
 if __name__ == '__main__':
     main()
