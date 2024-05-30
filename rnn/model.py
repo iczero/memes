@@ -260,6 +260,7 @@ class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_embed = config.d_embed
+        self.norm = nn.LayerNorm([config.d_embed])
         self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, config.d_embed,)))
         self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2, bias=config.qkv_bias)
 
@@ -267,7 +268,8 @@ class CharDecode(nn.Module):
         self.w_out = nn.Linear(config.d_embed, config.vocab_size)
 
     def forward(self, x: torch.Tensor):
-        kv_merged = self.kv_linear(x).unflatten(-1, (2, self.d_embed))
+        x_norm = self.norm(x)
+        kv_merged = self.kv_linear(x_norm).unflatten(-1, (2, self.d_embed))
         # kv_merged: (batch, stream, 2, n_embed)
         # no transpose since we have no n_heads
         k = kv_merged[..., 0, :]
