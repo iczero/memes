@@ -353,18 +353,18 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-6.5-silu'
+    run.name = 'autoencoder-6.6-gelu'
 
     model_config = ModelConfig(
-        d_embed=128,
-        n_attention_heads=6,
-        n_streams=32,
+        d_embed=180,
+        n_attention_heads=4,
+        n_streams=16,
         ff_dropout_p=0.0,
         attn_dropout_p=0.0,
         n_intermediate=0,
         resid_gate_multiplier=1.0,
-        d_ff_inner=512,
-        activation='silu',
+        d_ff_inner=1024,
+        activation='gelu',
         dtype='float32',
         qkv_bias=True,
         short_ctx_len=0,
