@@ -146,6 +146,7 @@ class Intermediate(nn.Module):
         self.d_embed = config.d_embed
         self.n_attention_heads = config.n_attention_heads
         self.resid_gate_multiplier = config.resid_gate_multiplier
+        self.n_streams = config.n_streams
 
         self.norm = nn.LayerNorm([config.d_embed])
         self.q_linear = BatchLinear(
@@ -159,6 +160,7 @@ class Intermediate(nn.Module):
             2 * config.n_attention_heads * config.d_embed,
             bias=config.qkv_bias,
         )
+        self.v_align = nn.Parameter(torch.randn((config.n_attention_heads * config.n_streams, config.n_streams)))
         self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
 
         ff_in_dim = config.d_embed * (config.n_attention_heads + 1)
@@ -178,7 +180,9 @@ class Intermediate(nn.Module):
         kv_merged = self.kv_linear(x_norm) \
             .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
         k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        # v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        # temp hack
+        v = (self.v_align @ x_norm).unflatten(-2, (self.n_attention_heads, self.n_streams))
 
         # -> (batch, stream, n_heads, d_embed)
         # pylint: disable-next=not-callable
@@ -200,6 +204,7 @@ class PreOutput(nn.Module):
         super().__init__()
         self.d_embed = config.d_embed
         self.n_attention_heads = config.n_attention_heads
+        self.n_streams = config.n_streams
 
         self.norm = nn.LayerNorm([config.d_embed])
         self.q_linear = BatchLinear(
@@ -213,6 +218,7 @@ class PreOutput(nn.Module):
             2 * config.n_attention_heads * config.d_embed,
             bias=config.qkv_bias,
         )
+        self.v_align = nn.Parameter(torch.randn((config.n_attention_heads * config.n_streams, config.n_streams)))
         self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads,)))
 
         # no skip
@@ -233,7 +239,9 @@ class PreOutput(nn.Module):
         kv_merged = self.kv_linear(x_norm) \
             .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
         k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        # v = kv_merged[..., 1, :, :].transpose(-2, -3)
+        # temp hack, -> (batch, n_heads, stream, d_embed) <https://arxiv.org/pdf/2403.01643>
+        v = (self.v_align @ x_norm).unflatten(-2, (self.n_attention_heads, self.n_streams))
 
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
@@ -247,8 +255,11 @@ class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_embed = config.d_embed
+        self.n_streams = config.n_streams
+
         self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, config.d_embed,)))
         self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2, bias=config.qkv_bias)
+        self.v_align = nn.Parameter(torch.randn((config.n_streams, config.n_streams)))
         self.norm = nn.LayerNorm([config.d_embed])
 
         self.feedforward = GLU(config.d_embed, config.d_embed, config.get_activation())
@@ -260,7 +271,9 @@ class CharDecode(nn.Module):
         # kv_merged: (batch, stream, 2, n_embed)
         # no transpose since we have no n_heads
         k = kv_merged[..., 0, :]
-        v = kv_merged[..., 1, :]
+        # v = kv_merged[..., 1, :]
+        # temp hack
+        v = self.v_align @ x
         q = self.out_query
 
         # pylint: disable-next=not-callable
@@ -321,7 +334,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-4.1.6'
+    run.name = 'autoencoder-6.1'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -358,7 +371,7 @@ def main():
 
     optimizer = torch.optim.AdamW(
         make_param_groups(model.named_parameters()),
-        lr=3e-4,
+        lr=1e-4,
         weight_decay=0.05,
     )
 
