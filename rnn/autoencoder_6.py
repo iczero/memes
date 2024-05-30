@@ -66,6 +66,26 @@ class BatchGLU(nn.Module):
         mid = self.activation(mid_1) * mid_2
         return self.w_out(mid)
 
+class ReversedLinear(nn.Module):
+    # A @ x + b, as opposed to the "normal" linear
+    # what is this even supposed to be?
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+
+        self.weight = nn.Parameter(torch.zeros((d_out, d_in)))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # uniform initialization between (-1/sqrt(in_features), 1/sqrt(in_features))
+        #bound = 1 / math.sqrt(self.d_in)
+        nn.init.normal_(self.weight)
+
+    def forward(self, x: torch.Tensor):
+        return self.weight @ x
+
 def apply_inline_gate(x: torch.Tensor, gate_multiplier: float):
     # (..., d_embed + 1) -> (..., d_embed)
     resid_gate = F.sigmoid(x[..., -1]) * gate_multiplier
@@ -155,12 +175,15 @@ class Intermediate(nn.Module):
             config.n_attention_heads * config.d_embed,
             has_bias=config.qkv_bias,
         )
-        self.kv_linear = nn.Linear(
+        self.k_linear = nn.Linear(
             config.d_embed,
-            2 * config.n_attention_heads * config.d_embed,
+            config.n_attention_heads * config.d_embed,
             bias=config.qkv_bias,
         )
-        self.v_align = nn.Parameter(torch.randn((config.n_attention_heads * config.n_streams, config.n_streams)))
+        self.v_linear = ReversedLinear(
+            config.n_streams,
+            config.n_attention_heads * config.n_streams,
+        )
         self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
 
         ff_in_dim = config.d_embed * (config.n_attention_heads + 1)
@@ -177,12 +200,12 @@ class Intermediate(nn.Module):
         q = self.q_linear(x_norm) \
             .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
             .transpose(-2, -3)
-        kv_merged = self.kv_linear(x_norm) \
-            .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
-        k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        # v = kv_merged[..., 1, :, :].transpose(-2, -3)
-        # temp hack
-        v = (self.v_align @ x_norm).unflatten(-2, (self.n_attention_heads, self.n_streams))
+        k = self.k_linear(x_norm) \
+            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
+            .transpose(-2, -3)
+        # no need for transpose
+        v = self.v_linear(x_norm) \
+            .unflatten(-2, (self.n_attention_heads, self.n_streams))
 
         # -> (batch, stream, n_heads, d_embed)
         # pylint: disable-next=not-callable
@@ -213,12 +236,15 @@ class PreOutput(nn.Module):
             config.n_attention_heads * config.d_embed,
             has_bias=config.qkv_bias,
         )
-        self.kv_linear = nn.Linear(
+        self.k_linear = nn.Linear(
             config.d_embed,
-            2 * config.n_attention_heads * config.d_embed,
+            config.n_attention_heads * config.d_embed,
             bias=config.qkv_bias,
         )
-        self.v_align = nn.Parameter(torch.randn((config.n_attention_heads * config.n_streams, config.n_streams)))
+        self.v_linear = ReversedLinear(
+            config.n_streams,
+            config.n_attention_heads * config.n_streams,
+        )
         self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads,)))
 
         # no skip
@@ -236,12 +262,11 @@ class PreOutput(nn.Module):
         q = self.q_linear(x_norm) \
             .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
             .transpose(-2, -3)
-        kv_merged = self.kv_linear(x_norm) \
-            .unflatten(-1, (2, self.n_attention_heads, self.d_embed))
-        k = kv_merged[..., 0, :, :].transpose(-2, -3)
-        # v = kv_merged[..., 1, :, :].transpose(-2, -3)
-        # temp hack, -> (batch, n_heads, stream, d_embed) <https://arxiv.org/pdf/2403.01643>
-        v = (self.v_align @ x_norm).unflatten(-2, (self.n_attention_heads, self.n_streams))
+        k = self.k_linear(x_norm) \
+            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
+            .transpose(-2, -3)
+        v = self.v_linear(x_norm) \
+            .unflatten(-2, (self.n_attention_heads, self.n_streams))
 
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
@@ -255,26 +280,20 @@ class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.d_embed = config.d_embed
-        self.n_streams = config.n_streams
-
         self.norm = nn.LayerNorm([config.d_embed])
         self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, config.d_embed,)))
-        self.kv_linear = nn.Linear(config.d_embed, config.d_embed * 2, bias=config.qkv_bias)
-        self.v_align = nn.Parameter(torch.randn((config.n_streams, config.n_streams)))
+        self.k_linear = nn.Linear(config.d_embed, config.d_embed, bias=config.qkv_bias)
+        self.v_linear = ReversedLinear(config.n_streams, config.n_streams)
 
         self.feedforward = GLU(config.d_embed, config.d_embed, config.get_activation())
         self.w_out = nn.Linear(config.d_embed, config.vocab_size)
 
     def forward(self, x: torch.Tensor):
         x_norm = self.norm(x)
-        kv_merged = self.kv_linear(x_norm).unflatten(-1, (2, self.d_embed))
-        # kv_merged: (batch, stream, 2, n_embed)
         # no transpose since we have no n_heads
-        k = kv_merged[..., 0, :]
-        # v = kv_merged[..., 1, :]
-        # temp hack
-        v = self.v_align @ x
         q = self.out_query
+        k = self.k_linear(x_norm)
+        v = self.v_linear(x_norm)
 
         # pylint: disable-next=not-callable
         attn_out = F.scaled_dot_product_attention(q, k, v)
@@ -334,7 +353,7 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-6.2'
+    run.name = 'autoencoder-6.5-silu'
 
     model_config = ModelConfig(
         d_embed=128,
@@ -345,7 +364,7 @@ def main():
         n_intermediate=0,
         resid_gate_multiplier=1.0,
         d_ff_inner=512,
-        activation='gelu',
+        activation='silu',
         dtype='float32',
         qkv_bias=True,
         short_ctx_len=0,
@@ -376,7 +395,7 @@ def main():
     )
 
     params_count = sum(p.numel() for p in model.parameters())
-    print('total parameters count:', params_count)
+    print(f'total parameters count: {params_count:_}')
 
     committed_mask = torch.full((batch_size, model_config.out_ctx_len), True, device=device)
     step = 0

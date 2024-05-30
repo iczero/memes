@@ -4,3 +4,4 @@
 - headscale: <https://arxiv.org/pdf/2110.09456.pdf>
 - jacobi decoding: <https://arxiv.org/abs/2305.10427>
 - perceiver IO: <https://arxiv.org/pdf/2107.14795>
+- the weird attention mod: <https://arxiv.org/pdf/2403.01643>

@@ -8,7 +8,7 @@
     "n_intermediate": 4,
     "resid_gate_multiplier": 1.0,
     "d_ff_inner": 512,
-    "activation": "gelu",
+    "activation": "silu",
     "dtype": "float32",
     "qkv_bias": true,
     "short_ctx_len": 64,

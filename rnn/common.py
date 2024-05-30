@@ -82,6 +82,8 @@ class ModelConfig:
     def get_activation(self):
         if self.activation == 'gelu':
             return nn.GELU()
+        if self.activation == 'silu':
+            return nn.SiLU()
         if self.activation == 'relu':
             return nn.ReLU()
         if self.activation == 'leakyrelu':
