@@ -353,18 +353,18 @@ def make_param_groups(named_parameters):
 def main():
     run = aim.Run()
     run.experiment = 'autoencoder-test'
-    run.name = 'autoencoder-6.6-gelu'
+    run.name = 'autoencoder-6.7-gelu'
 
     model_config = ModelConfig(
-        d_embed=180,
+        d_embed=176,
         n_attention_heads=4,
-        n_streams=16,
+        n_streams=24,
         ff_dropout_p=0.0,
         attn_dropout_p=0.0,
         n_intermediate=0,
         resid_gate_multiplier=1.0,
-        d_ff_inner=1024,
-        activation='gelu',
+        d_ff_inner=704,
+        activation='silu',
         dtype='float32',
         qkv_bias=True,
         short_ctx_len=0,
@@ -399,6 +399,7 @@ def main():
 
     committed_mask = torch.full((batch_size, model_config.out_ctx_len), True, device=device)
     step = 0
+    did_drop_lr = False
     while True:
         step += 1
         print('step:', step)
@@ -409,6 +410,7 @@ def main():
         _, _, output = model(model.recurrent_init.unsqueeze(0) \
             .repeat_interleave(batch_size, dim=0), sequences, committed_mask)
         loss = F.cross_entropy(output.transpose(-2, -1), sequences, reduction='mean')
+        loss_f = loss.item()
         loss.backward()
         grad_norm_f = nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -417,8 +419,14 @@ def main():
         ).item()
         optimizer.step()
 
-        run.track(loss.item(), name='loss', step=step)
+        run.track(loss_f, name='loss', step=step)
         run.track(grad_norm_f, name='grad_norm', step=step)
+
+        if not did_drop_lr and loss_f < 0.2:
+            did_drop_lr = True
+            for group in optimizer.param_groups:
+                # drop lr
+                group['lr'] = 1e-5
 
         if step % 25 == 0:
             for i in range(10):
@@ -428,10 +436,6 @@ def main():
                 text1 = f'batch {i}'
                 print(f'{text1} in  {seq_in}')
                 print(f'{" " * len(text1)} out {seq_out}')
-
-        if step % 5000 == 0:
-            from IPython import start_ipython
-            #start_ipython(argv=[], user_ns=locals() | globals())
 
 if __name__ == '__main__':
     main()

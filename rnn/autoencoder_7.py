@@ -1,26 +1,13 @@
 import math
 
+import aim
 import torch
+import torch._dynamo.config
+import torch.nn.functional as F
 from torch import nn
-from torch.nn import functional as F
 
-from .common import ModelConfig
-#from .rotary_encoding import RotaryEncoding
-
-# def oh_no(x: torch.Tensor):
-#     "oh no"
-#     if x.abs().max() > 1e12:
-#         print(x)
-#         print('offending value:', x.abs().max())
-#         raise RuntimeError('detected very large value(s)')
-#     if not torch.all(torch.isfinite(x)).item():
-#         if torch.any(torch.isnan(x)).item():
-#             print('detected nan values')
-#         if torch.any(torch.isinf(x)).item():
-#             print('detected +/-inf values')
-#
-#         print(x)
-#         raise RuntimeError('non-finite values detected')
+from .common import ModelConfig, dump_sequence
+from .data import filter_text, load_dataset
 
 class GLU(nn.Module):
     def __init__(self, in_dim, out_dim, activation, bias=True):
@@ -311,16 +298,15 @@ class CharDecode(nn.Module):
         logits_out = self.w_out(embeddings_out)
         return embeddings_out, logits_out
 
-class RNN(nn.Module):
+class Autoencoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
-        self.input = InputEncode(config)
-        self.input_adapter = Intermediate(config, is_cross=True)
-        self.intermediate = nn.ModuleList(
-            Intermediate(config) for _ in range(config.n_intermediate)
-        )
-        self.output_adapter = OutputAdapter(config)
+        self.input0 = InputEncode(config)
+        self.int1 = Intermediate(config, is_cross=True)
+        self.int2 = Intermediate(config)
+        self.int3 = Intermediate(config)
+        self.output4 = OutputAdapter(config)
         self.char_decode = CharDecode(config)
 
         init_bound = 1 / math.sqrt(config.d_embed)
@@ -332,12 +318,122 @@ class RNN(nn.Module):
         inputs: torch.Tensor,
         inputs_committed: torch.Tensor,
     ):
-        input_tokens = self.input(inputs, inputs_committed)
-        recurrent = recurrent + self.input_adapter(recurrent, input_tokens)
-        for layer in self.intermediate:
-            recurrent = recurrent + layer(recurrent)
+        input_tokens = self.input0(inputs, inputs_committed)
+        recurrent = recurrent + self.int1(recurrent, input_tokens)
+        recurrent = recurrent + self.int2(recurrent)
+        recurrent = recurrent + self.int3(recurrent)
+        recurrent = self.output4(recurrent)
 
-        output = self.output_adapter(recurrent)
-        embeddings_out, logits_out = self.char_decode(output)
+        embeddings_out, logits_out = self.char_decode(recurrent)
 
         return recurrent, embeddings_out, logits_out
+
+def to_bytes_list(s: str) -> list[int]:
+    return list(s.encode('utf-8'))
+
+def make_param_groups(named_parameters):
+    exclude_wd = []
+    default = []
+    for name, param in named_parameters:
+        if len(param.shape) < 2 or name.endswith('.recurrent_init') \
+                or name.endswith('.bias') or name.endswith('.out_query') \
+                or name.endswith('.positional_encodings') \
+                or name.endswith('.in_query'):
+            exclude_wd.append(param)
+        else:
+            default.append(param)
+
+    return [
+        { 'params': exclude_wd, 'weight_decay': 0.0 },
+        { 'params': default },
+    ]
+
+def main():
+    run = aim.Run()
+    run.experiment = 'autoencoder-test'
+    run.name = 'autoencoder-7-silu'
+
+    model_config = ModelConfig(
+        d_embed=176,
+        n_attention_heads=4,
+        n_streams=24,
+        ff_dropout_p=0.0,
+        attn_dropout_p=0.0,
+        n_intermediate=0,
+        resid_gate_multiplier=1.0,
+        d_ff_inner=704,
+        activation='silu',
+        dtype='float32',
+        qkv_bias=True,
+        short_ctx_len=0,
+        out_ctx_len=128,
+    )
+    batch_size = 128
+
+    data_path = '/mnt/data/opt/the-pile/train/00.jsonl.zst'
+    data_iter = filter_text(load_dataset(open(data_path, 'rb')))
+    def slice_stuff(data, target_len: int):
+        for el in data:
+            bytes_list = to_bytes_list(el)
+            if len(bytes_list) < target_len:
+                continue
+
+            yield bytes_list[:target_len]
+
+    data_iter = slice_stuff(data_iter, model_config.out_ctx_len)
+
+    device = torch.device('cuda')
+    model = Autoencoder(model_config)
+    model.to(device=device, dtype=model_config.get_dtype())
+
+    optimizer = torch.optim.AdamW(
+        make_param_groups(model.named_parameters()),
+        lr=3e-4,
+        weight_decay=0.05,
+    )
+
+    params_count = sum(p.numel() for p in model.parameters())
+    print(f'total parameters count: {params_count:_}')
+
+    committed_mask = torch.full((batch_size, model_config.out_ctx_len), True, device=device)
+    step = 0
+    did_drop_lr = False
+    while True:
+        step += 1
+        print('step:', step)
+        sequences = torch.tensor([next(data_iter) for n in range(batch_size)])
+        sequences = sequences.to(device)
+
+        optimizer.zero_grad()
+        _, _, output = model(model.recurrent_init.unsqueeze(0) \
+            .repeat_interleave(batch_size, dim=0), sequences, committed_mask)
+        loss = F.cross_entropy(output.transpose(-2, -1), sequences, reduction='mean')
+        loss_f = loss.item()
+        loss.backward()
+        grad_norm_f = nn.utils.clip_grad_norm_(
+            model.parameters(),
+            50.0,
+            error_if_nonfinite=True,
+        ).item()
+        optimizer.step()
+
+        run.track(loss_f, name='loss', step=step)
+        run.track(grad_norm_f, name='grad_norm', step=step)
+
+        if not did_drop_lr and loss_f < 0.2:
+            did_drop_lr = True
+            for group in optimizer.param_groups:
+                # drop lr
+                group['lr'] = 1e-5
+
+        if step % 25 == 0:
+            for i in range(10):
+                seq_in = dump_sequence(sequences[i])
+                seq_out = dump_sequence(output[i].argmax(dim=-1))
+
+                text1 = f'batch {i}'
+                print(f'{text1} in  {seq_in}')
+                print(f'{" " * len(text1)} out {seq_out}')
+
+if __name__ == '__main__':
+    main()

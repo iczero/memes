@@ -16,7 +16,7 @@ from .common import ControlTokens, ModelConfig, TrainConfig, dump_sequence
 from .data import SequenceProvider, filter_text, load_dataset
 from .model import RNN
 
-DISABLE_TORCH_COMPILE = True
+DISABLE_TORCH_COMPILE = False
 "If torch.compile should be disabled"
 HAS_PIN_MEMORY = True
 "Whether pin_memory may be used"
@@ -549,6 +549,9 @@ def main():
         model.named_parameters(),
         allow_fused=(device.type == 'cuda'),
     )
+
+    params_count = sum(p.numel() for p in model.parameters())
+    print(f'model has {params_count:_} parameters')
 
     if load_optimizer_state is not None:
         print('loading optimizer state')

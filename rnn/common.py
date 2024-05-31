@@ -150,7 +150,8 @@ class TrainConfig:
         for name, param in named_parameters:
             if len(param.shape) < 2 or name.endswith('.recurrent_init') \
                     or name.endswith('.bias') or name.endswith('.out_query') \
-                    or name.endswith('.positional_encodings'):
+                    or name.endswith('.positional_encodings') \
+                    or name.endswith('.in_query'):
                 exclude_wd.append(param)
             else:
                 default.append(param)
