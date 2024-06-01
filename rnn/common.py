@@ -123,6 +123,8 @@ class TrainConfig:
     "Minimum commit probability"
     drift_sample_temperature: float
     "Sampling temperature for token selection during training"
+    empty_bias: float
+    "Probability bias for the empty token"
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
@@ -138,7 +140,8 @@ class TrainConfig:
             short_ctx_dropout_p=float(obj['short_ctx_dropout_p']),
             drift_commit_p_scale=float(obj['drift_commit_p_scale']),
             drift_commit_p_min=float(obj['drift_commit_p_min']),
-            drift_sample_temperature=float(obj['drift_sample_temperature'])
+            drift_sample_temperature=float(obj['drift_sample_temperature']),
+            empty_bias=float(obj['empty_bias']),
         )
 
     def to_dict(self):

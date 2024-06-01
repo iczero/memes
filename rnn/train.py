@@ -202,8 +202,9 @@ class TrainBatch:
                 # add empty tokens to end
                 prev_out[-prev_shift:] = ControlTokens.EMPTY
 
-            # write expected output
             input_sequences[i][short_ctx_len:] = prev_out
+
+            # write expected output
             output_sequences[i][:] = torch.tensor(
                 info.sequence[info.offset + short_ctx_len : info.offset + short_ctx_len + out_ctx_len],
                 device='cpu',
@@ -248,11 +249,11 @@ class TrainBatch:
 
         # calculate losses
         # do the funny thing with the empty token
-        EMPTY_BIAS = 0.1 # TODO: config this?
+        empty_bias = self.train_config.empty_bias
         expected2 = F.one_hot(expected_output, vocab_size).type(torch.float32)
         expected2 = expected2 \
-            * (1 - EMPTY_BIAS) \
-            + torch.where(F.one_hot(torch.tensor(ControlTokens.EMPTY, device=recurrent.device), vocab_size) == 1, EMPTY_BIAS, 0.0)
+            * (1 - empty_bias) \
+            + torch.where(F.one_hot(torch.tensor(ControlTokens.EMPTY, device=recurrent.device), vocab_size) == 1, empty_bias, 0.0)
         # needs transpose due to cross_entropy shape expectations
         cross_entropy = F.cross_entropy(
             token_logits_out.transpose(-2, -1),
@@ -323,16 +324,10 @@ class TrainBatch:
                 self.active_batches,
             )
 
-        if isinstance(DEBUG_RECURRENT_GRAD, list):
-            next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad)) # type: ignore
-
-        self.recurrent = next_recurrent
-        self.prev_output_embeddings = embeddings_out
-        self.prev_output_tokens = tokens_out.to('cpu', non_blocking=True)
         next_shifts_cpu = next_shifts.to('cpu', non_blocking=True)
 
-        self.losses.append(full_weighted_lossses)
-        self.pos_weighted_losses.append(pos_weighted_losses)
+        if isinstance(DEBUG_RECURRENT_GRAD, list):
+            next_recurrent.register_hook(lambda grad: DEBUG_RECURRENT_GRAD.append(grad)) # type: ignore
 
         ended_count = 0
         active_batches = torch.full((self.batch_size,), True, device='cpu', pin_memory=HAS_PIN_MEMORY)
@@ -347,8 +342,11 @@ class TrainBatch:
                 batch_text = f'batch {i}'
                 print(batch_text, 'in ', dump_sequence(input_short_ctx[i]))
                 print(' ' * len(batch_text), 'out', dump_sequence(tokens_out[i]))
-                print('  drift:', _out_drift[i])
-                print(' commit:', _drift_commit_p[i])
+                print('   drift:', _out_drift[i])
+                print('  commit:', _drift_commit_p[i])
+                #print(' p.shift:', self.prev_shifts[i].item())
+                #print(' n.shift:', next_shifts_cpu[i].item())
+                #print(' prevout:', dump_sequence(self.prev_output_tokens[i]))
 
             shift = typing.cast(int, next_shifts_cpu[i].item())
             if shift > 0:
@@ -366,6 +364,13 @@ class TrainBatch:
                 else:
                     # advance sequence
                     info.offset += shift
+
+        self.recurrent = next_recurrent
+        self.prev_output_embeddings = embeddings_out
+        self.prev_output_tokens = tokens_out.to('cpu', non_blocking=True)
+
+        self.losses.append(full_weighted_lossses)
+        self.pos_weighted_losses.append(pos_weighted_losses)
 
         self.active_batches = active_batches.to(self.device, non_blocking=True)
         self.prev_shifts = next_shifts_cpu.to(self.device, non_blocking=True)
