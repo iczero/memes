@@ -397,7 +397,7 @@ def main():
 
     committed_mask = torch.full((batch_size, model_config.out_ctx_len), True, device=device)
     step = 0
-    did_drop_lr = False
+    did_drop_lr = None
     while True:
         step += 1
         print('step:', step)
@@ -420,10 +420,10 @@ def main():
         run.track(loss_f, name='loss', step=step)
         run.track(grad_norm_f, name='grad_norm', step=step)
 
-        if not did_drop_lr and loss_f < 0.2:
-            did_drop_lr = True
+        if did_drop_lr is None and loss_f < 0.1:
+            did_drop_lr = step
             for group in optimizer.param_groups:
-                # drop lr
+                print('drop lr')
                 group['lr'] = 1e-5
 
         if step % 25 == 0:
@@ -434,6 +434,11 @@ def main():
                 text1 = f'batch {i}'
                 print(f'{text1} in  {seq_in}')
                 print(f'{" " * len(text1)} out {seq_out}')
+
+        if did_drop_lr is not None and step > did_drop_lr + 250:
+            print('saving model')
+            torch.save(model.state_dict(), 'checkpoints/derp.pt')
+            break
 
 if __name__ == '__main__':
     main()
