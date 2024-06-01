@@ -205,7 +205,8 @@ class TrainBatch:
             # write expected output
             input_sequences[i][short_ctx_len:] = prev_out
             output_sequences[i][:] = torch.tensor(
-                info.sequence[info.offset + short_ctx_len : info.offset + short_ctx_len + out_ctx_len]
+                info.sequence[info.offset + short_ctx_len : info.offset + short_ctx_len + out_ctx_len],
+                device='cpu',
             )
 
             # print(
@@ -232,13 +233,32 @@ class TrainBatch:
         active_batches: torch.Tensor,
     ):
         out_ctx_len = self.model_config.out_ctx_len
+        vocab_size = self.model_config.vocab_size
         # forward model
         next_recurrent, embeddings_out, token_logits_out = \
             self.model(recurrent, input_sequence, committed_mask)
 
+        # sample token for tokens_out
+        # TODO: multinomial doesn't work with batches, use argmax for now
+        # tokens_out_sampled = (tokens_out / self.train_config.drift_sample_temperature) \
+        #     .softmax(dim=-1) \
+        #     .multinomial(1) \
+        #     .squeeze(-1)
+        tokens_out_sampled = token_logits_out.detach().argmax(dim=-1)
+
         # calculate losses
+        # do the funny thing with the empty token
+        EMPTY_BIAS = 0.1 # TODO: config this?
+        expected2 = F.one_hot(expected_output, vocab_size).type(torch.float32)
+        expected2 = expected2 \
+            * (1 - EMPTY_BIAS) \
+            + torch.where(F.one_hot(torch.tensor(ControlTokens.EMPTY, device=recurrent.device), vocab_size) == 1, EMPTY_BIAS, 0.0)
         # needs transpose due to cross_entropy shape expectations
-        cross_entropy = F.cross_entropy(token_logits_out.transpose(-2, -1), expected_output, reduction='none')
+        cross_entropy = F.cross_entropy(
+            token_logits_out.transpose(-2, -1),
+            expected2.transpose(-2, -1),
+            reduction='none',
+        )
         # cross entropy loss by position weighting but not drift weighting
         # detached since this is not used to calculate loss
         pos_weighted_losses = (cross_entropy.detach() * self.out_pos_weight) \
@@ -248,16 +268,19 @@ class TrainBatch:
         prev_shifted = batch_roll(prev_output_embeddings, prev_shifts)
         out_drift: torch.Tensor = ((embeddings_out.detach() - prev_shifted) ** 2).sum(dim=-1).sqrt()
         # calculate probability of commit
-        commit_p_coeff = self.train_config.drift_commit_p_scale * math.sqrt(self.model_config.d_embed)
+        # test maybe
+        # commit_p_coeff = self.train_config.drift_commit_p_scale * math.sqrt(self.model_config.d_embed)
+        commit_p_coeff = self.train_config.drift_commit_p_scale
         drift_commit_p = torch.pow(2., -out_drift / commit_p_coeff)
-        # mask "new" outputs to zero
+        # mask "new" and "empty" outputs to zero
         drift_commit_p = torch.where(
-            (torch.arange(-out_ctx_len, 0, device=prev_shifts.device) >= -prev_shifts.unsqueeze(-1)),
+            (tokens_out_sampled == ControlTokens.EMPTY)
+                .logical_or(torch.arange(-out_ctx_len, 0, device=recurrent.device) >= -prev_shifts.unsqueeze(-1)),
             0.,
             drift_commit_p
         )
         # apply minimum probability for commit
-        drift_commit_p = drift_commit_p.maximum(torch.tensor(self.train_config.drift_commit_p_min))
+        drift_commit_p = drift_commit_p.maximum(torch.tensor(self.train_config.drift_commit_p_min, device=recurrent.device))
 
         drift_committed = drift_commit_p.bernoulli()
         # find first uncommitted index, or out_ctx_len if all are committed
@@ -277,19 +300,11 @@ class TrainBatch:
         pos_weighted_losses_mean = (pos_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
         full_weighted_losses_mean = (full_weighted_losses * batch_mask).sum(dim=-1) / batch_mask_sum
 
-        # sample token for tokens_out
-        # TODO: multinomial doesn't work with batches, use argmax for now
-        # tokens_out_sampled = (tokens_out / self.train_config.drift_sample_temperature) \
-        #     .softmax(dim=-1) \
-        #     .multinomial(1) \
-        #     .squeeze(-1)
-        tokens_out_sampled = token_logits_out.argmax(dim=-1)
-
         # no grads needed
         embeddings_out = embeddings_out.detach()
 
         return next_recurrent, tokens_out_sampled, embeddings_out, full_weighted_losses_mean, \
-            pos_weighted_losses_mean, next_shifts, out_drift
+            pos_weighted_losses_mean, next_shifts, out_drift, drift_commit_p
 
     def forward_step(self, dump=False):
         short_ctx_len = self.model_config.short_ctx_len
@@ -297,7 +312,7 @@ class TrainBatch:
         input_short_ctx, committed_mask, expected_output = self.prepare_batch()
 
         next_recurrent, tokens_out, embeddings_out, full_weighted_lossses, \
-            pos_weighted_losses, next_shifts, _out_drift = \
+            pos_weighted_losses, next_shifts, _out_drift, _drift_commit_p = \
             self.forward_batch(
                 self.recurrent,
                 input_short_ctx,
@@ -332,6 +347,8 @@ class TrainBatch:
                 batch_text = f'batch {i}'
                 print(batch_text, 'in ', dump_sequence(input_short_ctx[i]))
                 print(' ' * len(batch_text), 'out', dump_sequence(tokens_out[i]))
+                print('  drift:', _out_drift[i])
+                print(' commit:', _drift_commit_p[i])
 
             shift = typing.cast(int, next_shifts_cpu[i].item())
             if shift > 0:

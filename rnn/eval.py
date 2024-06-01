@@ -3,8 +3,8 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from sentencepiece import SentencePieceProcessor
 
+from .common import ControlTokens
 from .model import ModelConfig, RNNSequence
 
 
@@ -15,8 +15,6 @@ class InferenceHelper:
     "Model config"
     model: RNNSequence
     "Model object"
-    tokenizer: SentencePieceProcessor
-    "Tokenizer object"
     device: torch.device
     "Device for model"
     dtype: torch.dtype
@@ -34,13 +32,11 @@ class InferenceHelper:
         self,
         config: ModelConfig,
         model: RNNSequence,
-        tokenizer: SentencePieceProcessor,
         device: torch.device,
         dtype: torch.dtype,
     ):
         self.config = config
         self.model = model
-        self.tokenizer = tokenizer
         self.device = device
         self.dtype = dtype
         self.sequence = []
@@ -55,8 +51,8 @@ class InferenceHelper:
     def initialize(self):
         self.offset = 0
         self.prev_offset = None
-        self.sequence = [self.tokenizer['<pad>']] * self.config.short_ctx_len
-        self.recurrent = self.model.make_recurrent_init()
+        self.sequence = [ControlTokens.PAD] * self.config.short_ctx_len
+        self.recurrent = self.model.recurrent_init
 
     @property
     def offset_end(self):
@@ -77,8 +73,8 @@ class InferenceHelper:
         return self.sequence[self.config.short_ctx_len : self.offset_end]
 
     @torch.compile(disable=DISABLE_TORCH_COMPILE)
-    def _forward(self, recurrent: torch.Tensor, short_ctx: torch.Tensor, new_mask: torch.Tensor):
-        return self.model(recurrent, short_ctx, new_mask)
+    def _forward(self, recurrent: torch.Tensor, input_sequence: torch.Tensor, committed_mask: torch.Tensor):
+        return self.model(recurrent, input_sequence, committed_mask)
 
     def noisy_step(self, short_ctx: torch.Tensor, max_ponder = 16):
         halt = False
@@ -113,7 +109,6 @@ class InferenceHelper:
 
     def noisy_generate(
         self,
-        tokenizer: SentencePieceProcessor,
         prompt: str | None = None,
         max_ponder: int = 16,
         limit: int = 128,
@@ -216,14 +211,11 @@ def main():
     model = RNNSequence(config)
     model.load_state_dict(loaded['model_state'])
     dtype = config.get_dtype()
-    tokenizer = SentencePieceProcessor()
-    tokenizer.Init(model_file=config.tokenizer_model_path)
 
     with torch.inference_mode():
-        infer = InferenceHelper(config, model, tokenizer, device, dtype)
+        infer = InferenceHelper(config, model, device, dtype)
         prompt = sys.argv[2] if len(sys.argv) > 2 else None
         infer.noisy_generate(
-            tokenizer,
             prompt,
             max_ponder=4,
             temperature=0.7,

@@ -23,7 +23,7 @@
     "clip_grad_norm": 10.0,
     "optimizer": "AdamW",
     "short_ctx_dropout_p": 0.0,
-    "drift_commit_p_scale": 100.0,
+    "drift_commit_p_scale": 10.0,
     "drift_commit_p_min": 0.1,
     "drift_sample_temperature": 0.5
   }
