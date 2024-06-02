@@ -249,18 +249,19 @@ class TrainBatch:
 
         # calculate losses
         # do the funny thing with the empty token
-        empty_bias = self.train_config.empty_bias
-        expected2 = F.one_hot(expected_output, vocab_size).type(torch.float32)
-        expected2 = expected2 \
-            * (1 - empty_bias) \
-            + torch.where(F.one_hot(torch.tensor(ControlTokens.EMPTY, device=recurrent.device), vocab_size) == 1, empty_bias, 0.0)
-        # needs transpose due to cross_entropy shape expectations
-        cross_entropy = F.cross_entropy(
-            token_logits_out.transpose(-2, -1),
-            expected2.transpose(-2, -1),
-            reduction='none',
-        )
+        # empty_bias = self.train_config.empty_bias
+        # expected2 = F.one_hot(expected_output, vocab_size).type(torch.float32)
+        # expected2 = expected2 \
+        #     * (1 - empty_bias) \
+        #     + torch.where(F.one_hot(torch.tensor(ControlTokens.EMPTY, device=recurrent.device), vocab_size) == 1, empty_bias, 0.0)
+        # # needs transpose due to cross_entropy shape expectations
+        # cross_entropy = F.cross_entropy(
+        #     token_logits_out.transpose(-2, -1),
+        #     expected2.transpose(-2, -1),
+        #     reduction='none',
+        # )
         # cross entropy loss by position weighting but not drift weighting
+        cross_entropy = F.cross_entropy(token_logits_out.transpose(-2, -1), expected_output, reduction='none')
         # detached since this is not used to calculate loss
         pos_weighted_losses = (cross_entropy.detach() * self.out_pos_weight) \
             .sum(dim=-1) / self.out_pos_weight.sum(dim=-1)
