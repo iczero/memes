@@ -234,7 +234,6 @@ class TrainBatch:
         active_batches: torch.Tensor,
     ):
         out_ctx_len = self.model_config.out_ctx_len
-        vocab_size = self.model_config.vocab_size
         # forward model
         next_recurrent, embeddings_out, token_logits_out = \
             self.model(recurrent, input_sequence, committed_mask)
@@ -248,20 +247,8 @@ class TrainBatch:
         tokens_out_sampled = token_logits_out.detach().argmax(dim=-1)
 
         # calculate losses
-        # do the funny thing with the empty token
-        # empty_bias = self.train_config.empty_bias
-        # expected2 = F.one_hot(expected_output, vocab_size).type(torch.float32)
-        # expected2 = expected2 \
-        #     * (1 - empty_bias) \
-        #     + torch.where(F.one_hot(torch.tensor(ControlTokens.EMPTY, device=recurrent.device), vocab_size) == 1, empty_bias, 0.0)
-        # # needs transpose due to cross_entropy shape expectations
-        # cross_entropy = F.cross_entropy(
-        #     token_logits_out.transpose(-2, -1),
-        #     expected2.transpose(-2, -1),
-        #     reduction='none',
-        # )
-        # cross entropy loss by position weighting but not drift weighting
         cross_entropy = F.cross_entropy(token_logits_out.transpose(-2, -1), expected_output, reduction='none')
+        # cross entropy loss by position weighting but not drift weighting
         # detached since this is not used to calculate loss
         pos_weighted_losses = (cross_entropy.detach() * self.out_pos_weight) \
             .sum(dim=-1) / self.out_pos_weight.sum(dim=-1)
@@ -345,9 +332,9 @@ class TrainBatch:
                 print(' ' * len(batch_text), 'out', dump_sequence(tokens_out[i]))
                 print('   drift:', _out_drift[i])
                 print('  commit:', _drift_commit_p[i])
-                #print(' p.shift:', self.prev_shifts[i].item())
+                print(' prevout:', dump_sequence(self.prev_output_tokens[i]))
+                print(' p.shift:', self.prev_shifts[i].item())
                 #print(' n.shift:', next_shifts_cpu[i].item())
-                #print(' prevout:', dump_sequence(self.prev_output_tokens[i]))
 
             shift = typing.cast(int, next_shifts_cpu[i].item())
             if shift > 0:
