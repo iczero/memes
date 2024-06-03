@@ -25,8 +25,10 @@ class ModelConfig:
     "Embedding dimensions"
     n_attention_heads: int
     "Number of attention heads"
-    n_streams: int
-    "Number of streams"
+    n_int_streams: int
+    "Number of internal (recurrent) streams"
+    n_ext_streams: int
+    "Number of external streams"
     # TODO: dropout is not currently implemented
     ff_dropout_p: float
     "Probability of dropout after feedforward"
@@ -63,7 +65,8 @@ class ModelConfig:
         return cls(
             d_embed=int(obj['d_embed']),
             n_attention_heads=int(obj['n_attention_heads']),
-            n_streams=int(obj['n_streams']),
+            n_int_streams=int(obj['n_int_streams']),
+            n_ext_streams=int(obj['n_ext_streams']),
             ff_dropout_p=float(obj['ff_dropout_p']),
             attn_dropout_p=float(obj['attn_dropout_p']),
             n_intermediate=int(obj['n_intermediate']),

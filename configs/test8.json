@@ -2,10 +2,11 @@
   "model_config": {
     "d_embed": 176,
     "n_attention_heads": 4,
-    "n_streams": 24,
+    "n_int_streams": 12,
+    "n_ext_streams": 12,
     "ff_dropout_p": 0.0,
     "attn_dropout_p": 0.0,
-    "n_intermediate": 4,
+    "n_intermediate": 5,
     "resid_gate_multiplier": 1.0,
     "d_ff_inner": 704,
     "activation": "silu",
@@ -25,7 +26,6 @@
     "short_ctx_dropout_p": 0.0,
     "drift_commit_p_scale": 10.0,
     "drift_commit_p_min": 0.1,
-    "drift_sample_temperature": 0.5,
-    "empty_bias": 0.1
+    "drift_sample_temperature": 0.5
   }
 }

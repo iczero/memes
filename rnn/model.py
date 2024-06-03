@@ -114,7 +114,7 @@ class InputEncode(nn.Module):
         self.positional_encodings = nn.Parameter(
             torch.randn((config.short_ctx_len + config.out_ctx_len, config.d_embed))
         )
-        self.in_query = nn.Parameter(torch.randn((config.n_streams, config.d_embed,)))
+        self.in_query = nn.Parameter(torch.randn((config.n_ext_streams, config.d_embed,)))
         self.kv_linear = nn.Linear(
             config.d_embed,
             2 * config.n_attention_heads * config.d_embed,
@@ -124,7 +124,7 @@ class InputEncode(nn.Module):
 
         ff_in_dim = config.d_embed * config.n_attention_heads
         self.feedforward = BatchGLU(
-            n_streams=config.n_streams,
+            n_streams=config.n_ext_streams,
             d_in=ff_in_dim,
             d_mid=config.d_ff_inner,
             d_out=config.d_embed,
@@ -158,133 +158,110 @@ class InputEncode(nn.Module):
 
         return ff_out
 
-class Intermediate(nn.Module):
-    def __init__(self, config: ModelConfig, is_cross = False):
+class PartialCrossAttention(nn.Module):
+    def __init__(self, config: ModelConfig, a_streams: int, b_streams: int):
         super().__init__()
-        self.is_cross = is_cross
-        self.d_embed = config.d_embed
+        self.a_streams = a_streams
+        self.b_streams = b_streams
+        self.total_streams = a_streams + b_streams
         self.n_attention_heads = config.n_attention_heads
-        self.resid_gate_multiplier = config.resid_gate_multiplier
-        self.n_streams = config.n_streams
-
-        self.norm = nn.LayerNorm([config.d_embed])
-        if self.is_cross:
-            # use separate layernorm for cross attention
-            self.cross_norm = nn.LayerNorm([config.d_embed])
+        self.d_embed = config.d_embed
 
         self.q_linear = BatchLinear(
-            config.n_streams,
+            self.a_streams,
             config.d_embed,
             config.n_attention_heads * config.d_embed,
             has_bias=config.qkv_bias,
         )
-        self.k_linear = nn.Linear(
+        self.k_a_linear = nn.Linear(
             config.d_embed,
             config.n_attention_heads * config.d_embed,
             bias=config.qkv_bias,
         )
-        self.v_linear = ReversedLinear(
-            config.n_streams,
-            config.n_attention_heads * config.n_streams,
+        self.k_b_linear = nn.Linear(
+            config.d_embed,
+            config.n_attention_heads * config.d_embed,
+            bias=config.qkv_bias,
         )
-        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
+        self.v1_a_linear = nn.Linear(config.d_embed, config.d_embed, bias=config.qkv_bias)
+        self.v1_b_linear = nn.Linear(config.d_embed, config.d_embed, bias=config.qkv_bias)
+        self.v2_linear = ReversedLinear(
+            self.total_streams,
+            config.n_attention_heads * self.total_streams,
+        )
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor):
+        # a: self, b: other
+        # query from self
+        q = self.q_linear(a) \
+            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
+            .transpose(-2, -3)
+        # keys from self
+        k_a = self.k_a_linear(a).unflatten(-1, (self.n_attention_heads, self.d_embed))
+        # keys from other
+        k_b = self.k_b_linear(b).unflatten(-1, (self.n_attention_heads, self.d_embed))
+        k = torch.cat((k_a, k_b), dim=-3).transpose(-2, -3)
+        # transform for values
+        v1_a = self.v1_a_linear(a)
+        v1_b = self.v1_b_linear(b)
+        # concatenate and apply "sequence mixing"
+        v = self.v2_linear(torch.cat((v1_a, v1_b), dim=-2)) \
+            .unflatten(-2, (self.n_attention_heads, self.total_streams))
+        # pylint: disable-next=not-callable
+        attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
+        return attn_out
+
+class Intermediate(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.d_embed = config.d_embed
+        self.n_attention_heads = config.n_attention_heads
+        self.resid_gate_multiplier = config.resid_gate_multiplier
+        self.n_int_streams = config.n_int_streams
+        self.n_ext_streams = config.n_ext_streams
+        self.n_total_streams = config.n_int_streams + config.n_ext_streams
+
+        self.int_norm = nn.LayerNorm([config.d_embed])
+        self.ext_norm = nn.LayerNorm([config.d_embed])
+        self.attn_int = PartialCrossAttention(config, self.n_int_streams, self.n_ext_streams)
+        self.attn_ext = PartialCrossAttention(config, self.n_ext_streams, self.n_int_streams)
+        self.head_scales_int = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
+        self.head_scales_ext = nn.Parameter(torch.ones((config.n_attention_heads + 1,)))
 
         ff_in_dim = config.d_embed * (config.n_attention_heads + 1)
         self.feedforward = BatchGLU(
-            n_streams=config.n_streams,
+            n_streams=config.n_int_streams + config.n_ext_streams,
             d_in=ff_in_dim,
             d_mid=config.d_ff_inner,
             d_out=config.d_embed + 1,
             activation=config.get_activation(),
         )
 
-    def forward(self, recurrent: torch.Tensor, cross: torch.Tensor | None = None):
-        assert self.is_cross == (cross is not None)
-        recurrent_norm = self.norm(recurrent)
-        if self.is_cross:
-            cross_norm = self.cross_norm(cross)
-        else:
-            # self attention
-            cross_norm = recurrent_norm
+    def forward(self, x_int: torch.Tensor, x_ext: torch.Tensor):
+        x_int_norm = self.int_norm(x_int)
+        x_ext_norm = self.ext_norm(x_ext)
 
-        q = self.q_linear(recurrent_norm) \
-            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
-            .transpose(-2, -3)
-        k = self.k_linear(cross_norm) \
-            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
-            .transpose(-2, -3)
-        # no need for transpose
-        v = self.v_linear(cross_norm) \
-            .unflatten(-2, (self.n_attention_heads, self.n_streams))
-
+        x_attn_int = self.attn_int(x_int_norm, x_ext_norm)
+        x_attn_ext = self.attn_ext(x_ext_norm, x_int_norm)
         # -> (batch, stream, n_heads, d_embed)
-        # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
         # add skip
-        attn_out = torch.cat((attn_out, recurrent_norm.unsqueeze(-2)), dim=-2)
+        x_attn_int = torch.cat((x_attn_int, x_int_norm.unsqueeze(-2)), dim=-2)
+        x_attn_ext = torch.cat((x_attn_ext, x_ext_norm.unsqueeze(-2)), dim=-2)
         # scale heads
-        attn_out = self.head_scales.unsqueeze(-1) * attn_out
+        x_attn_int = self.head_scales_int.unsqueeze(-1) * x_attn_int
+        x_attn_ext = self.head_scales_ext.unsqueeze(-1) * x_attn_ext
 
-        attn_concat = attn_out.flatten(-2, -1)
-        # attn_concat: (batch, stream, n_heads * d_embed + 1)
-        ff_out = self.feedforward(attn_concat)
+        # concat internal and external
+        x_attn = torch.cat((x_attn_int, x_attn_ext), dim=-3)
+        # concat heads
+        x_attn_concat = x_attn.flatten(-2, -1)
+        # x_attn_concat: (batch, stream, n_heads * d_embed + 1)
+        ff_out = self.feedforward(x_attn_concat)
 
         resid = apply_inline_gate(ff_out, self.resid_gate_multiplier)
-        return resid
-
-class OutputAdapter(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.d_embed = config.d_embed
-        self.n_attention_heads = config.n_attention_heads
-        self.n_streams = config.n_streams
-
-        self.norm = nn.LayerNorm([config.d_embed])
-        self.q_linear = BatchLinear(
-            config.n_streams,
-            config.d_embed,
-            config.n_attention_heads * config.d_embed,
-            has_bias=config.qkv_bias,
-        )
-        self.k_linear = nn.Linear(
-            config.d_embed,
-            config.n_attention_heads * config.d_embed,
-            bias=config.qkv_bias,
-        )
-        self.v_linear = ReversedLinear(
-            config.n_streams,
-            config.n_attention_heads * config.n_streams,
-        )
-        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads,)))
-
-        # no skip
-        ff_in_dim = config.d_embed * config.n_attention_heads
-        self.feedforward = BatchGLU(
-            n_streams=config.n_streams,
-            d_in=ff_in_dim,
-            d_mid=config.d_ff_inner,
-            d_out=config.d_embed,
-            activation=config.get_activation(),
-        )
-
-    def forward(self, x: torch.Tensor):
-        x_norm = self.norm(x)
-        q = self.q_linear(x_norm) \
-            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
-            .transpose(-2, -3)
-        k = self.k_linear(x_norm) \
-            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
-            .transpose(-2, -3)
-        v = self.v_linear(x_norm) \
-            .unflatten(-2, (self.n_attention_heads, self.n_streams))
-
-        # pylint: disable-next=not-callable
-        attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
-        # scale heads
-        attn_out = self.head_scales.unsqueeze(-1) * attn_out
-        attn_concat = attn_out.flatten(-2, -1)
-        ff_out = self.feedforward(attn_concat)
-        return ff_out
+        # split internal/external
+        resid_int, resid_ext = resid.split([self.n_int_streams, self.n_ext_streams], dim=-2)
+        return resid_int, resid_ext
 
 class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -293,7 +270,7 @@ class CharDecode(nn.Module):
         self.norm = nn.LayerNorm([config.d_embed])
         self.out_query = nn.Parameter(torch.randn((config.out_ctx_len, config.d_embed,)))
         self.k_linear = nn.Linear(config.d_embed, config.d_embed, bias=config.qkv_bias)
-        self.v_linear = ReversedLinear(config.n_streams, config.n_streams)
+        self.v_linear = ReversedLinear(config.n_ext_streams, config.n_ext_streams)
 
         self.feedforward = GLU(config.d_embed, config.d_embed, config.get_activation())
         self.w_out = nn.Linear(config.d_embed, config.vocab_size)
@@ -314,13 +291,11 @@ class CharDecode(nn.Module):
 class RNN(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.recurrent_init = nn.Parameter(torch.zeros(config.n_streams, config.d_embed))
+        self.recurrent_init = nn.Parameter(torch.zeros(config.n_int_streams, config.d_embed))
         self.input = InputEncode(config)
-        self.input_adapter = Intermediate(config, is_cross=True)
         self.intermediate = nn.ModuleList(
             Intermediate(config) for _ in range(config.n_intermediate)
         )
-        self.output_adapter = OutputAdapter(config)
         self.char_decode = CharDecode(config)
 
         init_bound = 1 / math.sqrt(config.d_embed)
@@ -332,12 +307,12 @@ class RNN(nn.Module):
         inputs: torch.Tensor,
         inputs_committed: torch.Tensor,
     ):
-        input_tokens = self.input(inputs, inputs_committed)
-        recurrent = recurrent + self.input_adapter(recurrent, input_tokens)
+        external = self.input(inputs, inputs_committed)
         for layer in self.intermediate:
-            recurrent = recurrent + layer(recurrent)
+            recurrent_resid, external_resid = layer(recurrent, external)
+            recurrent = recurrent + recurrent_resid
+            external = external + external_resid
 
-        output = self.output_adapter(recurrent)
-        embeddings_out, logits_out = self.char_decode(output)
+        embeddings_out, logits_out = self.char_decode(external)
 
         return recurrent, embeddings_out, logits_out
