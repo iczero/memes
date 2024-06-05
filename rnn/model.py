@@ -263,6 +263,60 @@ class Intermediate(nn.Module):
         resid_int, resid_ext = resid.split([self.n_int_streams, self.n_ext_streams], dim=-2)
         return resid_int, resid_ext
 
+class OutputAdapter(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.d_embed = config.d_embed
+        self.n_attention_heads = config.n_attention_heads
+        self.n_ext_streams = config.n_ext_streams
+
+        self.norm = nn.LayerNorm([config.d_embed])
+        self.q_linear = BatchLinear(
+            config.n_ext_streams,
+            config.d_embed,
+            config.n_attention_heads * config.d_embed,
+            has_bias=config.qkv_bias,
+        )
+        self.k_linear = nn.Linear(
+            config.d_embed,
+            config.n_attention_heads * config.d_embed,
+            bias=config.qkv_bias,
+        )
+        self.v_linear = ReversedLinear(
+            config.n_ext_streams,
+            config.n_attention_heads * config.n_ext_streams,
+        )
+        self.head_scales = nn.Parameter(torch.ones((config.n_attention_heads,)))
+
+        # no skip
+        ff_in_dim = config.d_embed * config.n_attention_heads
+        self.feedforward = BatchGLU(
+            n_streams=config.n_ext_streams,
+            d_in=ff_in_dim,
+            d_mid=config.d_ff_inner,
+            d_out=config.d_embed,
+            activation=config.get_activation(),
+        )
+
+    def forward(self, x: torch.Tensor):
+        x_norm = self.norm(x)
+        q = self.q_linear(x_norm) \
+            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
+            .transpose(-2, -3)
+        k = self.k_linear(x_norm) \
+            .unflatten(-1, (self.n_attention_heads, self.d_embed)) \
+            .transpose(-2, -3)
+        v = self.v_linear(x_norm) \
+            .unflatten(-2, (self.n_attention_heads, self.n_ext_streams))
+
+        # pylint: disable-next=not-callable
+        attn_out = F.scaled_dot_product_attention(q, k, v).transpose(-2, -3)
+        # scale heads
+        attn_out = self.head_scales.unsqueeze(-1) * attn_out
+        attn_concat = attn_out.flatten(-2, -1)
+        ff_out = self.feedforward(attn_concat)
+        return ff_out
+
 class CharDecode(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -296,6 +350,7 @@ class RNN(nn.Module):
         self.intermediate = nn.ModuleList(
             Intermediate(config) for _ in range(config.n_intermediate)
         )
+        self.output_adapter = OutputAdapter(config)
         self.char_decode = CharDecode(config)
 
         init_bound = 1 / math.sqrt(config.d_embed)
@@ -313,6 +368,7 @@ class RNN(nn.Module):
             recurrent = recurrent + recurrent_resid
             external = external + external_resid
 
+        external = self.output_adapter(external)
         embeddings_out, logits_out = self.char_decode(external)
 
         return recurrent, embeddings_out, logits_out
